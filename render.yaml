@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: tarang-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "5000"
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: PYTHON_BRIDGE_URL
+        value: https://kyle-nondenunciatory-rugosely.ngrok-free.dev
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLIENT_URL
+        sync: false
