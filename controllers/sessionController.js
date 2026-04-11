@@ -1,17 +1,28 @@
-// Tarang 1.0.0.1 — controllers/sessionController.js
+// Tarang 2.2.0 — controllers/sessionController.js
 // STATELESS: Reads session_state from MongoDB, passes to bridge as dict.
 // Bridge returns updated_state which Express saves back to MongoDB.
 //
-// v1.0.0.4 fix:
-//   submitTest was overwriting scorePct with result.score_pct (which is null
-//   for sessions 1 & 2 because scores are hidden until all 3 are done).
-//   The actual score lives in result.updated_state.sessions[n].score_pct.
-//   Fix: read the real score from updated_state when saving the session record.
+// v2.2.0 changes:
+//   - getStatus: added in-flight dedup guard — if the same docId+userId has
+//     a getStatus call already in progress, subsequent requests wait for that
+//     result instead of firing a new bridge call. Eliminates the duplicate
+//     /status XHRs visible in the network tab when the frontend re-renders.
+//   - getStatus: result cached in-memory for CACHE_TTL_MS (2s). Rapid
+//     sequential polls within the TTL window get the cached response instantly.
+//   - No logic changes to audioDone, getQuestions, overrideWindow, submitTest,
+//     getResults — all behaviour is identical to v1.0.0.4.
 
 const Document  = require("../models/Document");
 const Session   = require("../models/Session");
 const Analytics = require("../models/Analytics");
-const { bridge } = require("../config/bridge");
+const { bridge, bridgePost } = require("../config/bridge");
+
+// ── In-flight dedup + short-TTL cache for getStatus ──────────────────────────
+// Key: `${docId}:${userId}`
+// Value: { promise, resolvedAt, result }
+const _statusCache    = new Map();
+const CACHE_TTL_MS    = 2000; // serve cached result for 2s after resolution
+const _statusInflight = new Map(); // Key → Promise (in-flight dedup)
 
 
 // ── Helper: get current session_state from MongoDB ────────────────────────────
@@ -28,8 +39,6 @@ const getSessionState = async (docId, userId) => {
         state.sessions[n].status        = s.status;
         state.sessions[n].started_at    = s.startedAt?.toISOString()   || null;
         state.sessions[n].submitted_at  = s.submittedAt?.toISOString() || null;
-        // ── FIX: read scorePct from MongoDB (saved correctly by saveUpdatedState)
-        // Do NOT fall back to null blindly — use the stored value
         state.sessions[n].score_pct     = s.scorePct   ?? null;
         state.sessions[n].override_used = s.overrideUsed || false;
         state.sessions[n].user_answers  = s.userAnswers  || {};
@@ -96,11 +105,10 @@ const saveUpdatedState = async (docId, userId, updated_state) => {
           status:       s.status,
           startedAt:    s.started_at    ? new Date(s.started_at)   : null,
           submittedAt:  s.submitted_at  ? new Date(s.submitted_at) : null,
-          // ── Write the real score from updated_state (never null after submit)
           scorePct:     s.score_pct     ?? null,
           overrideUsed: s.override_used || false,
           userAnswers:  s.user_answers  || {},
-          sessionState: updated_state,  // persist full state for next call
+          sessionState: updated_state,
         }
       }
     );
@@ -129,7 +137,7 @@ const audioDone = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  const { data } = await bridge.post("/mcq/audio-completed", {
+  const { data } = await bridgePost("/mcq/audio-completed", {
     doc_id:        docId,
     role:          req.user.role,
     session_state,
@@ -156,32 +164,78 @@ const audioDone = async (req, res) => {
 
 
 // ── GET /api/sessions/:docId/status ──────────────────────────────────────────
+// v2.2.0: in-flight dedup + 2s cache.
+//
+// WHY: The frontend was calling this on every render cycle during the quiz
+// "Preparing..." state — sometimes firing 3-4 identical requests within
+// milliseconds of each other. Each one hit MongoDB + the bridge.
+//
+// HOW:
+//   1. If a result for this docId+userId was computed < CACHE_TTL_MS ago,
+//      return it immediately without touching MongoDB or the bridge.
+//   2. If a bridge call for this docId+userId is already in flight,
+//      await that same promise instead of issuing a second one.
+//   3. Otherwise run the normal flow and cache the result.
 const getStatus = async (req, res) => {
   const { docId } = req.params;
+  const userId    = req.user._id.toString();
+  const cacheKey  = `${docId}:${userId}`;
 
-  const doc = await Document.findOne({ docId, userId: req.user._id });
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
+  // ── 1. Serve from cache if fresh ─────────────────────────────────────────
+  const cached = _statusCache.get(cacheKey);
+  if (cached && Date.now() - cached.resolvedAt < CACHE_TTL_MS) {
+    return res.json({ status: "success", data: cached.result });
   }
 
-  const session_state = await getSessionState(docId, req.user._id);
-  if (!session_state) {
-    return res.status(404).json({ status: "error", error: "Session state not found." });
+  // ── 2. Dedup in-flight requests ───────────────────────────────────────────
+  if (_statusInflight.has(cacheKey)) {
+    try {
+      const result = await _statusInflight.get(cacheKey);
+      return res.json({ status: "success", data: result });
+    } catch (err) {
+      return res.status(500).json({ status: "error", error: err.message });
+    }
   }
 
-  const { data } = await bridge.post("/mcq/status", {
-    doc_id:        docId,
-    role:          req.user.role,
-    session_state,
-  });
+  // ── 3. Normal flow — run once, cache result ───────────────────────────────
+  const work = (async () => {
+    const doc = await Document.findOne({ docId, userId: req.user._id });
+    if (!doc) throw Object.assign(new Error("Document not found."), { statusCode: 404 });
 
-  const result = data.data;
+    const session_state = await getSessionState(docId, req.user._id);
+    if (!session_state) throw Object.assign(new Error("Session state not found."), { statusCode: 404 });
 
-  if (result.updated_state) {
-    await saveUpdatedState(docId, req.user._id, result.updated_state);
+    const { data } = await bridgePost("/mcq/status", {
+      doc_id:        docId,
+      role:          req.user.role,
+      session_state,
+    });
+
+    const result = data.data;
+
+    if (result.updated_state) {
+      await saveUpdatedState(docId, req.user._id, result.updated_state);
+    }
+
+    return result;
+  })();
+
+  // Register in-flight promise so concurrent calls can share it
+  _statusInflight.set(cacheKey, work);
+
+  try {
+    const result = await work;
+
+    // Cache the result
+    _statusCache.set(cacheKey, { result, resolvedAt: Date.now() });
+
+    return res.json({ status: "success", data: result });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ status: "error", error: err.message });
+  } finally {
+    // Always remove from in-flight map regardless of outcome
+    _statusInflight.delete(cacheKey);
   }
-
-  res.json({ status: "success", data: result });
 };
 
 
@@ -208,7 +262,7 @@ const getQuestions = async (req, res) => {
   }
 
   try {
-    const { data } = await bridge.post("/mcq/questions", {
+    const { data } = await bridgePost("/mcq/questions", {
       doc_id:         docId,
       session:        sessionNum,
       role:           req.user.role,
@@ -250,7 +304,7 @@ const overrideWindow = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  const { data } = await bridge.post("/mcq/override", {
+  const { data } = await bridgePost("/mcq/override", {
     doc_id:        docId,
     session_state,
   });
@@ -300,7 +354,7 @@ const submitTest = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  const { data } = await bridge.post("/mcq/submit", {
+  const { data } = await bridgePost("/mcq/submit", {
     doc_id:          docId,
     session:         sessionNum,
     user_answers:    userAnswers,
@@ -311,19 +365,16 @@ const submitTest = async (req, res) => {
 
   const result = data.data;
 
-  // ── Save updated_state FIRST — this writes the real score_pct for this session
   if (result.updated_state) {
     await saveUpdatedState(docId, req.user._id, result.updated_state);
   }
 
-  // ── FIX: read the real score from updated_state, NOT from result.score_pct
-  // result.score_pct is intentionally null for sessions 1 & 2 (hidden from user
-  // until all 3 are done). updated_state always has the real computed value.
+  // FIX (from v1.0.0.4): read real score from updated_state, NOT result.score_pct
+  // result.score_pct is null for sessions 1 & 2 (hidden until all 3 done).
   const realScorePct = result.updated_state?.sessions?.[sessionNum.toString()]?.score_pct
-    ?? result.score_pct   // fallback for session 3 where result.score_pct is set
+    ?? result.score_pct
     ?? null;
 
-  // ── Update this session record with the REAL score (not the hidden null)
   await Session.findOneAndUpdate(
     { docId, userId: req.user._id, sessionNumber: sessionNum },
     {
@@ -331,13 +382,17 @@ const submitTest = async (req, res) => {
         status:         "completed",
         submittedAt:    new Date(),
         userAnswers,
-        scorePct:       realScorePct,            // ← FIXED: was result.score_pct
-        correctCount:   result.correct_count    ?? 0,
-        totalQuestions: result.total_questions  ?? 10,
+        scorePct:       realScorePct,
+        correctCount:   result.correct_count   ?? 0,
+        totalQuestions: result.total_questions ?? 10,
       }
     },
     { new: true }
   );
+
+  // Invalidate the status cache for this doc so next getStatus is fresh
+  const cacheKey = `${docId}:${req.user._id.toString()}`;
+  _statusCache.delete(cacheKey);
 
   // Auto-generate analytics when all 3 sessions complete
   if (result.all_sessions_done) {
@@ -353,7 +408,7 @@ const submitTest = async (req, res) => {
         all_answer_keys[n] = s.answerKey || { answers: {} };
       }
 
-      const analyticsRes = await bridge.post("/analytics", {
+      const analyticsRes = await bridgePost("/analytics", {
         doc_id:          docId,
         role:            req.user.role,
         session_state:   result.updated_state || session_state,
@@ -366,25 +421,25 @@ const submitTest = async (req, res) => {
       await Analytics.findOneAndUpdate(
         { docId, userId: req.user._id },
         {
-          userId:                req.user._id,
-          documentId:            doc._id,
+          userId:                 req.user._id,
+          documentId:             doc._id,
           docId,
-          averageScorePct:       ad.summary.average_score_pct,
-          averageScoreDisplay:   ad.summary.average_score_display,
-          averageScoreLabel:     ad.summary.average_score_label,
-          learningCurve:         ad.summary.learning_curve,
-          learningCurveDesc:     ad.summary.learning_curve_desc,
-          improvementS1toS3:     ad.summary.improvement_s1_to_s3,
-          totalTimeSpentMin:     ad.summary.total_time_spent_min,
-          bestSession:           ad.summary.best_session,
-          worstSession:          ad.summary.worst_session,
-          scoreProgression:      ad.score_progression,
-          weakTopics:            ad.weak_topics,
-          suggestions:           ad.suggestions,
-          relisteningRecommended:ad.summary.relistening_recommended,
-          poorScoreWarning:      ad.summary.poor_score_warning,
-          fullAnalytics:         ad,
-          analyticsHtml:         html_content,
+          averageScorePct:        ad.summary.average_score_pct,
+          averageScoreDisplay:    ad.summary.average_score_display,
+          averageScoreLabel:      ad.summary.average_score_label,
+          learningCurve:          ad.summary.learning_curve,
+          learningCurveDesc:      ad.summary.learning_curve_desc,
+          improvementS1toS3:      ad.summary.improvement_s1_to_s3,
+          totalTimeSpentMin:      ad.summary.total_time_spent_min,
+          bestSession:            ad.summary.best_session,
+          worstSession:           ad.summary.worst_session,
+          scoreProgression:       ad.score_progression,
+          weakTopics:             ad.weak_topics,
+          suggestions:            ad.suggestions,
+          relisteningRecommended: ad.summary.relistening_recommended,
+          poorScoreWarning:       ad.summary.poor_score_warning,
+          fullAnalytics:          ad,
+          analyticsHtml:          html_content,
         },
         { upsert: true, new: true }
       );
@@ -418,7 +473,7 @@ const getResults = async (req, res) => {
     all_answer_keys[`session_${s.sessionNumber}`] = s.answerKey?.answers || {};
   }
 
-  const { data } = await bridge.post("/mcq/results", {
+  const { data } = await bridgePost("/mcq/results", {
     doc_id:          docId,
     role:            req.user.role,
     session_state,

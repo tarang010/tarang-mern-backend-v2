@@ -1,6 +1,11 @@
-// Tarang 1.0.0.1 — routes/documentRoutes.js
+// Tarang 2.2.0 — routes/documentRoutes.js
+//
+// v2.2.0 change:
+//   Added GET /by-doc-id/:docId/stream — SSE endpoint that replaces the
+//   frontend polling loop. Must be declared BEFORE /by-doc-id/:docId so
+//   Express doesn't treat "stream" as a docId value.
+//
 // IMPORTANT: Specific routes MUST come before generic /:id routes in Express.
-// Otherwise /:id swallows all specific paths like /by-doc-id/xxx, /upload etc.
 
 const express     = require("express");
 const multer      = require("multer");
@@ -9,8 +14,9 @@ const {
   uploadDocument,
   triggerMCQ,
   getDocuments,
-  getDocument,
   getDocumentByDocId,
+  streamDocumentStatus,
+  getDocument,
   deleteDocument,
   getCaptions,
   getVisualization,
@@ -20,22 +26,23 @@ const router  = express.Router();
 const storage = multer.memoryStorage();
 const upload  = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-  fileFilter: (_req, _file, cb) => cb(null, true), // validate in controller
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, _file, cb) => cb(null, true),
 });
 
-// ── Static / specific routes FIRST (before any /:param routes) ───────────────
+// ── Static / specific routes FIRST ───────────────────────────────────────────
 
-// List all documents
-router.get("/", protect, getDocuments);
-
-// Upload new document — multipart
+router.get("/",        protect, getDocuments);
 router.post("/upload", protect, upload.single("file"), uploadDocument);
 
-// Poll pipelineStatus — MUST be before /:id
-router.get("/by-doc-id/:docId", protect, getDocumentByDocId);
+// SSE stream — must come BEFORE /by-doc-id/:docId so Express doesn't
+// match "stream" as the docId parameter on the one-shot route below.
+router.get("/by-doc-id/:docId/stream", protect, streamDocumentStatus);
 
-// ── /:docId sub-routes — MUST be before /:id ─────────────────────────────────
+// One-shot poll — kept for backward compat, Postman, mobile
+router.get("/by-doc-id/:docId",        protect, getDocumentByDocId);
+
+// ── /:docId sub-routes ────────────────────────────────────────────────────────
 router.post("/:docId/trigger-mcq",   protect, triggerMCQ);
 router.get ("/:docId/captions",      protect, getCaptions);
 router.get ("/:docId/visualization", protect, getVisualization);

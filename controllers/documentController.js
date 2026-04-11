@@ -1,21 +1,26 @@
-// Tarang 1.0.0.1 — controllers/documentController.js
+// Tarang 2.2.0 — controllers/documentController.js
 // TWO-PHASE PIPELINE:
 //   Phase 1 (/pipeline/audio)  — runs in background after upload → 202 response
 //   Phase 2 (/pipeline/mcq)    — runs in background when user clicks Play
 //
-// Frontend polls GET /api/documents/by-doc-id/:docId every 3s
-// until pipelineStatus === "audio_ready" before showing the player.
+// v2.2.0 changes:
+//   - getDocumentByDocId kept as-is for Postman / mobile fallback
+//   - streamDocumentStatus ADDED — SSE endpoint that replaces frontend polling
+//     Frontend opens ONE connection, server pushes status until "ready"/"error"
+//   - No polling logic added to the controller — all DB reads happen server-side
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
-const { bridge, wakeBridge }              = require("../config/bridge");
+const { bridge, bridgePost, wakeBridge }              = require("../config/bridge");
 const { uploadAudioBuffer, isConfigured } = require("../config/cloudinary");
 
-// Pipeline timeout — 20 minutes.
-// Covers worst case: 200KB+ PDF → 2500+ words → 22min audio → modulation.
-// Axios timeout on FormData streams must be set via this constant AND passed
-// explicitly on every bridge.post() call — do not rely on the axios default.
 const PIPELINE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
+
+// How often the SSE handler polls MongoDB while streaming (ms)
+const SSE_POLL_INTERVAL_MS = parseInt(process.env.SSE_POLL_INTERVAL_MS || "3000", 10);
+
+// Max time to keep an SSE connection alive before auto-closing (ms)
+const SSE_TIMEOUT_MS = parseInt(process.env.SSE_TIMEOUT_MS || String(10 * 60 * 1000), 10); // 10 min
 
 
 // ── POST /api/documents/upload ────────────────────────────────────────────────
@@ -39,7 +44,7 @@ const uploadDocument = async (req, res) => {
     .digest("hex")
     .slice(0, 12);
 
-  // ── Save doc immediately with status "processing" ─────────────────────────
+  // Save doc immediately with status "processing"
   const doc = await Document.findOneAndUpdate(
     { docId: tempDocId, userId: req.user._id },
     {
@@ -61,7 +66,7 @@ const uploadDocument = async (req, res) => {
 
   console.log(`→ Upload received | docId=${tempDocId} | file=${req.file.originalname} | size=${req.file.size}B`);
 
-  // ── Respond 202 immediately ───────────────────────────────────────────────
+  // Respond 202 immediately
   res.status(202).json({
     status: "success",
     data: {
@@ -71,21 +76,18 @@ const uploadDocument = async (req, res) => {
     },
   });
 
-  // ── Capture values needed in background before req/res go out of scope ────
+  // Capture values needed in background before req/res go out of scope
   const fileBuffer   = req.file.buffer;
   const fileOrigName = req.file.originalname;
   const fileMimetype = req.file.mimetype;
   const userId       = req.user._id;
   const userRole     = req.user.role;
 
-  // ── Run Phase 1 pipeline in background ────────────────────────────────────
+  // Run Phase 1 pipeline in background
   setImmediate(async () => {
     try {
       console.log(`→ Background Phase 1 START | docId=${tempDocId}`);
 
-      // ── Wake bridge first — absorbs cold start on free tier ──────────────
-      // This polls /health until the Python pod responds (up to 90s).
-      // If the bridge is already warm this returns in < 1s.
       await wakeBridge();
 
       const FormData = require("form-data");
@@ -100,16 +102,11 @@ const uploadDocument = async (req, res) => {
       form.append("role",            userRole);
       if (voiceId) form.append("voice_id", voiceId);
 
-      // ── Build axios config explicitly ─────────────────────────────────────
-      // timeout must be set here AND on the axios instance.
-      // For multipart streams, axios applies the timeout to the entire
-      // request lifecycle only when passed directly — not from defaults.
       const axiosConfig = {
         headers:          form.getHeaders(),
         maxContentLength: Infinity,
         maxBodyLength:    Infinity,
         timeout:          PIPELINE_TIMEOUT_MS,
-        // Disable axios response data size limit — MP3 base64 can be large
         responseType:     "json",
       };
 
@@ -119,7 +116,6 @@ const uploadDocument = async (req, res) => {
       const pd = bridgeRes.data;
       console.log(`✓ Bridge response | docId=${tempDocId} | words=${pd.word_count} | duration=${pd.duration_sec}s`);
 
-      // ── Upload audio to Cloudinary ────────────────────────────────────────
       let audioCloudUrl = null;
       let audioPublicId = null;
 
@@ -140,7 +136,6 @@ const uploadDocument = async (req, res) => {
         }
       }
 
-      // ── Update document — Phase 1 complete ───────────────────────────────
       await Document.findOneAndUpdate(
         { docId: tempDocId, userId },
         {
@@ -167,7 +162,6 @@ const uploadDocument = async (req, res) => {
       console.log(`✓ Phase 1 COMPLETE | docId=${tempDocId} | status=audio_ready`);
 
     } catch (err) {
-      // Log full error details so we can see if it's a timeout vs crash
       const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
       console.error(
         `✗ Phase 1 FAILED | docId=${tempDocId} | type=${isTimeout ? "TIMEOUT" : "ERROR"} | ${err.message}`
@@ -200,19 +194,18 @@ const triggerMCQ = async (req, res) => {
     return res.json({ status: "success", data: { message: "Document too short for MCQ." } });
   }
 
-  // Respond immediately
   res.json({ status: "success", data: { message: "MCQ generation started in background." } });
 
   setImmediate(async () => {
     try {
       console.log(`→ Background MCQ START | docId=${docId}`);
 
-      const { data: mcqRes } = await bridge.post("/pipeline/mcq", {
+      const { data: mcqRes } = await bridgePost("/pipeline/mcq", {
         extracted_text: doc.extractedText,
         document_title: doc.title,
         doc_id:         docId,
       }, {
-        timeout: PIPELINE_TIMEOUT_MS,  // MCQ generation (OpenAI calls) can also be slow
+        timeout: PIPELINE_TIMEOUT_MS,
       });
 
       const md           = mcqRes.data;
@@ -273,7 +266,8 @@ const getDocuments = async (req, res) => {
 
 
 // ── GET /api/documents/by-doc-id/:docId ──────────────────────────────────────
-// Used by frontend polling to check pipelineStatus during background processing
+// Kept for backward compat — Postman, mobile, one-shot checks.
+// Frontend should use /by-doc-id/:docId/stream instead.
 const getDocumentByDocId = async (req, res) => {
   const { docId } = req.params;
   const doc = await Document.findOne({ docId, userId: req.user._id });
@@ -281,6 +275,105 @@ const getDocumentByDocId = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
   res.json({ status: "success", data: { document: doc } });
+};
+
+
+// ── GET /api/documents/by-doc-id/:docId/stream ───────────────────────────────
+// SSE endpoint. Frontend subscribes ONCE. Server polls MongoDB internally
+// and pushes status events until pipelineStatus === "ready" or "error".
+//
+// Replaces the frontend polling loop that was generating 141 requests.
+// Net result: 1 connection → ~5-6 internal DB reads total.
+//
+// Events:
+//   "status" — pipeline progress update (fires on every internal poll)
+//   "done"   — terminal state reached, stream closes
+//   "error"  — server-side or transport error
+const streamDocumentStatus = async (req, res) => {
+  const { docId } = req.params;
+  const userId    = req.user._id;
+
+  // SSE headers
+  res.setHeader("Content-Type",      "text/event-stream");
+  res.setHeader("Cache-Control",     "no-cache, no-transform");
+  res.setHeader("Connection",        "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable Nginx buffering
+  res.flushHeaders();                        // flush headers to client immediately
+
+  // Write a typed SSE event — guards against writing to a closed socket
+  const send = (event, data) => {
+    if (res.writableEnded) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (typeof res.flush === "function") res.flush();
+  };
+
+  // Heartbeat comment every 25s — prevents proxies closing idle connections
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(": ping\n\n");
+  }, 25_000);
+
+  // Hard timeout — auto-close after SSE_TIMEOUT_MS
+  const hardTimeout = setTimeout(() => {
+    send("error", { message: "Pipeline timed out. Please retry." });
+    cleanup();
+  }, SSE_TIMEOUT_MS);
+
+  let pollTimer = null;
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    clearTimeout(hardTimeout);
+    clearTimeout(pollTimer);
+    if (!res.writableEnded) res.end();
+  };
+
+  // If client disconnects early (user navigates away), stop polling
+  req.on("close", cleanup);
+
+  const poll = async () => {
+    try {
+      // Fetch only the fields the frontend needs — skip questions/extracted text
+      const doc = await Document.findOne(
+        { docId, userId },
+        "docId pipelineStatus pipelineError title audioUrl audioCloudUrl sessionsGenerated createdAt"
+      ).lean();
+
+      if (!doc) {
+        send("error", { message: "Document not found." });
+        return cleanup();
+      }
+
+      const status = doc.pipelineStatus;
+
+      // Always push current state so frontend can show granular progress
+      send("status", {
+        docId:             doc.docId,
+        status,
+        title:             doc.title,
+        audioUrl:          doc.audioCloudUrl || doc.audioUrl || null,
+        sessionsGenerated: doc.sessionsGenerated || 0,
+        pipelineError:     doc.pipelineError || null,
+      });
+
+      // Terminal states — stop polling and close stream
+      if (status === "ready" || status === "error") {
+        send("done", { docId: doc.docId, status });
+        return cleanup();
+      }
+
+      // Non-terminal — schedule next check
+      pollTimer = setTimeout(poll, SSE_POLL_INTERVAL_MS);
+
+    } catch (err) {
+      console.error("[SSE] streamDocumentStatus error:", err.message);
+      send("error", { message: "Internal error during status check." });
+      cleanup();
+    }
+  };
+
+  // Kick off immediately
+  poll();
 };
 
 
@@ -324,25 +417,46 @@ const getCaptions = async (req, res) => {
   if (doc.captions && doc.captions.length > 0) {
     return res.json({
       status: "success",
-      data: { captions: doc.captions, total: doc.captions.length, cached: true, generatedAt: doc.captionsGeneratedAt },
+      data: {
+        captions:     doc.captions,
+        total:        doc.captions.length,
+        cached:       true,
+        generatedAt:  doc.captionsGeneratedAt,
+      },
     });
   }
   if (!doc.extractedText || !doc.durationSec) {
     return res.status(404).json({ status: "error", error: "Captions not available." });
   }
-  const { data } = await bridge.post("/captions", { text: doc.extractedText, duration_sec: doc.durationSec });
-  const result   = data.data;
-  await Document.findOneAndUpdate({ docId }, { captions: result.captions, captionsGeneratedAt: new Date() });
-  res.json({ status: "success", data: { captions: result.captions, total: result.total_segments, cached: false } });
+  const { data } = await bridgePost("/captions", {
+    text:        doc.extractedText,
+    duration_sec: doc.durationSec,
+  });
+  const result = data.data;
+  await Document.findOneAndUpdate(
+    { docId },
+    { captions: result.captions, captionsGeneratedAt: new Date() }
+  );
+  res.json({
+    status: "success",
+    data:   { captions: result.captions, total: result.total_segments, cached: false },
+  });
 };
 
 
 // ── GET /api/documents/:docId/visualization ───────────────────────────────────
 const getVisualization = async (req, res) => {
   const { docId } = req.params;
-  const doc = await Document.findOne({ docId, userId: req.user._id }).select("visualizationHtml visualizationType title");
-  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
-  if (!doc.visualizationHtml) return res.status(404).json({ status: "error", error: "Visualization not available." });
+  const doc = await Document.findOne(
+    { docId, userId: req.user._id },
+    "visualizationHtml visualizationType title"
+  );
+  if (!doc) {
+    return res.status(404).json({ status: "error", error: "Document not found." });
+  }
+  if (!doc.visualizationHtml) {
+    return res.status(404).json({ status: "error", error: "Visualization not available." });
+  }
   res.setHeader("Content-Type", "text/html");
   res.send(doc.visualizationHtml);
 };
@@ -353,6 +467,7 @@ module.exports = {
   triggerMCQ,
   getDocuments,
   getDocumentByDocId,
+  streamDocumentStatus,   // NEW in v2.2.0
   getDocument,
   deleteDocument,
   getCaptions,

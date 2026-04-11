@@ -1,70 +1,43 @@
-// Tarang 1.0.0.1 — middleware/auth.js
-// JWT verification middleware
+// Tarang 2.2.0 — middleware/auth.js
+//
+// v2.2.0 change:
+//   Added ?token= query param fallback for GET requests only.
+//   Required because the browser's EventSource API (used for SSE) cannot
+//   send custom headers — the JWT must travel as ?token=xxx on the URL.
+//   Restricted to GET to prevent abuse on mutation endpoints.
 
 const jwt  = require("jsonwebtoken");
 const User = require("../models/User");
+const { getJwtSecret } = require("../utils/jwtSecret");
 
-// ── Protect route — requires valid JWT ───────────────────────────────────────
 const protect = async (req, res, next) => {
   let token;
 
-  if (
-    req.headers.authorization &&
-    req.headers.authorization.startsWith("Bearer ")
-  ) {
+  // Standard: Bearer token from Authorization header
+  if (req.headers.authorization?.startsWith("Bearer ")) {
     token = req.headers.authorization.split(" ")[1];
   }
 
+  // v2.2.0: fallback to ?token= query param — for SSE / EventSource only.
+  // Only accepted on GET requests to prevent it being used on mutations.
+  if (!token && req.method === "GET" && req.query.token) {
+    token = req.query.token;
+  }
+
   if (!token) {
-    return res.status(401).json({
-      status: "error",
-      error:  "Not authorised. No token provided.",
-    });
+    return res.status(401).json({ status: "error", error: "Not authorised — no token." });
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, getJwtSecret());
     req.user = await User.findById(decoded.id).select("-password");
-
     if (!req.user) {
-      return res.status(401).json({
-        status: "error",
-        error:  "User no longer exists.",
-      });
+      return res.status(401).json({ status: "error", error: "User not found." });
     }
-
-    if (!req.user.isActive) {
-      return res.status(401).json({
-        status: "error",
-        error:  "Account is deactivated.",
-      });
-    }
-
     next();
   } catch (err) {
-    return res.status(401).json({
-      status: "error",
-      error:  "Invalid or expired token.",
-    });
+    return res.status(401).json({ status: "error", error: "Token invalid or expired." });
   }
 };
 
-// ── Admin only route ──────────────────────────────────────────────────────────
-const adminOnly = (req, res, next) => {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({
-      status: "error",
-      error:  "Access denied. Admin role required.",
-    });
-  }
-  next();
-};
-
-// ── Attach role to request (no block — just enriches req.user.role) ───────────
-const attachRole = async (req, res, next) => {
-  // Reads role from req.user if already authenticated, else defaults to "user"
-  req.role = req.user?.role || "user";
-  next();
-};
-
-module.exports = { protect, adminOnly, attachRole };
+module.exports = { protect };

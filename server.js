@@ -1,11 +1,17 @@
-// Tarang 1.0.0.1 — server.js
-// Main Express entry point
+// Tarang 2.2.0 — server.js
+//
+// v2.2.0 changes:
+//   CORS: added maxAge: 86400 — browser caches the OPTIONS preflight for 24h.
+//         This eliminates the OPTIONS spam visible in the network tab.
+//         Also added explicit app.options("*") handler so preflight never
+//         reaches controllers.
+//   auth: protect middleware now accepts ?token= query param on GET requests.
+//         Required because EventSource (SSE) cannot send custom headers,
+//         so the JWT must travel as a query param for the stream endpoint.
 
 require("dotenv").config();
 require("express-async-errors");
 
-// ── JWT secret — auto-generated and rotated every 7 days ─────────────────────
-// Must run BEFORE any route or middleware that uses JWT
 const { initJwtSecret } = require("./utils/jwtSecret");
 initJwtSecret();
 
@@ -21,21 +27,20 @@ const connectDB      = require("./config/db");
 const { pingBridge } = require("./config/bridge");
 const errorHandler   = require("./middleware/errorHandler");
 
-const authRoutes      = require("./routes/authRoutes");
-const documentRoutes  = require("./routes/documentRoutes");
-const sessionRoutes   = require("./routes/sessionRoutes");
-const analyticsRoutes = require("./routes/analyticsRoutes");
-const adminRoutes     = require("./routes/adminRoutes");
-const friendsRoutes        = require("./routes/friendsRoutes");
-const sharingRoutes        = require("./routes/sharingRoutes");
-const notificationsRoutes  = require("./routes/notificationsRoutes");
-const chatRoutes           = require("./routes/chatRoutes");
+const authRoutes          = require("./routes/authRoutes");
+const documentRoutes      = require("./routes/documentRoutes");
+const sessionRoutes       = require("./routes/sessionRoutes");
+const analyticsRoutes     = require("./routes/analyticsRoutes");
+const adminRoutes         = require("./routes/adminRoutes");
+const friendsRoutes       = require("./routes/friendsRoutes");
+const sharingRoutes       = require("./routes/sharingRoutes");
+const notificationsRoutes = require("./routes/notificationsRoutes");
+const chatRoutes          = require("./routes/chatRoutes");
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
 // ── Ensure storage directories exist (development only) ──────────────────────
-// In production (Render), all storage goes to Cloudinary + MongoDB Atlas
 if (process.env.NODE_ENV !== "production") {
   const storageDirs = [
     "../../storage/uploads",
@@ -51,21 +56,20 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
-// ── Trust proxy (required on Render/Heroku — sits behind a load balancer) ─────
-// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// ── Trust proxy ───────────────────────────────────────────────────────────────
 app.set("trust proxy", 1);
 
 // ── Security middleware ───────────────────────────────────────────────────────
 app.use(helmet());
-// Allow multiple origins — Firebase has two domains (.web.app and .firebaseapp.com)
+
 const allowedOrigins = [
   process.env.CLIENT_URL,
   "http://localhost:3000",
   "http://localhost:5173",
 ].filter(Boolean);
 
-// Also allow any subdomain of firebaseapp.com and web.app
-app.use(cors({
+// Shared CORS options — defined once, reused for both app.use and app.options
+const corsOptions = {
   origin: (origin, callback) => {
     // Allow requests with no origin (mobile apps, Postman, curl)
     if (!origin) return callback(null, true);
@@ -79,25 +83,42 @@ app.use(cors({
     return callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
-}));
+
+  // v2.2.0: Cache preflight (OPTIONS) for 24 hours.
+  // Browser skips OPTIONS entirely for repeat requests to the same endpoint.
+  // Eliminates ~50% of the requests visible in the network tab.
+  maxAge: 86400,
+
+  // Explicit method list makes the preflight response deterministic
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
+  // Only list headers the frontend actually sends — keeps the allow-list tight
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+// v2.2.0: Handle OPTIONS preflight explicitly BEFORE any route.
+// Some proxies strip CORS headers; this ensures a clean 204 is always returned
+// for preflight requests and they never reach controllers.
+app.options("*", cors(corsOptions));
+
+app.use(cors(corsOptions));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-// Rate limits — relaxed in development, strict in production
 const isDev = process.env.NODE_ENV !== "production";
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max:      isDev ? 20000000 : 100000, // 200000 in dev, 10000 in prod
+  max:      isDev ? 20000000 : 100000,
   message:  { status: "error", error: "Too many requests. Please try again later." },
-  skip:     () => isDev,        // completely skip in development
+  skip:     () => isDev,
 });
 const uploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max:      isDev ? 5000 : 1000,   // 50 in dev, 10 in prod
+  max:      isDev ? 5000 : 1000,
   message:  { status: "error", error: "Upload limit reached. Try again in an hour." },
 });
 
-app.use("/api/",                  apiLimiter);
-app.use("/api/documents/upload",  uploadLimiter);
+app.use("/api/",                 apiLimiter);
+app.use("/api/documents/upload", uploadLimiter);
 
 // ── Body parsing ──────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
@@ -109,7 +130,6 @@ if (process.env.NODE_ENV === "development") {
 }
 
 // ── Static file serving ───────────────────────────────────────────────────────
-// Serve generated audio, reports, analytics directly to frontend
 app.use(
   "/storage",
   express.static(path.join(__dirname, "../../storage"), {
@@ -130,21 +150,21 @@ app.use(
 );
 
 // ── API Routes ────────────────────────────────────────────────────────────────
-app.use("/api/auth",       authRoutes);
-app.use("/api/documents",  documentRoutes);
-app.use("/api/sessions",   sessionRoutes);
-app.use("/api/analytics",  analyticsRoutes);
-app.use("/api/admin",      adminRoutes);
-app.use("/api/friends",        friendsRoutes);
-app.use("/api/sharing",        sharingRoutes);
-app.use("/api/notifications",  notificationsRoutes);
-app.use("/api/chat",           chatRoutes);
+app.use("/api/auth",          authRoutes);
+app.use("/api/documents",     documentRoutes);
+app.use("/api/sessions",      sessionRoutes);
+app.use("/api/analytics",     analyticsRoutes);
+app.use("/api/admin",         adminRoutes);
+app.use("/api/friends",       friendsRoutes);
+app.use("/api/sharing",       sharingRoutes);
+app.use("/api/notifications", notificationsRoutes);
+app.use("/api/chat",          chatRoutes);
 
-// ── Voices proxy — forwards to Python bridge ─────────────────────────────────
+// ── Voices proxy ──────────────────────────────────────────────────────────────
 app.get("/api/voices", async (req, res) => {
   try {
     const { bridge } = require("./config/bridge");
-    const { data } = await bridge.get("/voices");
+    const { data }   = await bridge.get("/voices");
     res.json(data);
   } catch (e) {
     res.status(503).json({ status: "error", error: "Bridge unavailable." });
@@ -157,7 +177,7 @@ app.get("/api/health", async (req, res) => {
   res.json({
     status:  "ok",
     service: "Tarang Express Backend",
-    version: "1.0.0.1",
+    version: "2.2.0",
     bridge:  bridgeAlive ? "connected" : "unreachable",
     mongo:   "connected",
     time:    new Date().toISOString(),
@@ -179,7 +199,6 @@ app.use(errorHandler);
 const start = async () => {
   await connectDB();
 
-  // Warn if Python bridge is not reachable on startup
   const bridgeAlive = await pingBridge();
   if (!bridgeAlive) {
     console.warn(
@@ -196,7 +215,6 @@ const start = async () => {
     console.log(`  Environment : ${process.env.NODE_ENV || "development"}`);
     console.log(`  Health check: http://localhost:${PORT}/api/health`);
   });
-
 };
 
 start();

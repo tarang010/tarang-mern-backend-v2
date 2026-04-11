@@ -1,10 +1,10 @@
-// Tarang 1.0.0.1 — routes/sessionRoutes.js
+// Tarang 2.2.0 — routes/sessionRoutes.js
+// No route changes in v2.2.0.
+// Duplicate /status calls are handled inside sessionController.js via
+// in-flight dedup + 2s cache — no route-level changes needed.
+//
 // IMPORTANT: Route order matters in Express.
 // Static paths must come BEFORE parameterized paths.
-//
-// NOTE: /status and /results are now POST because they need
-// session_state in the body (read from MongoDB by the controller,
-// passed to the stateless bridge).
 
 const express = require("express");
 const router  = express.Router();
