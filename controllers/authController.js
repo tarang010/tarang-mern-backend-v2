@@ -1,12 +1,26 @@
-// Tarang 2.0.0 — controllers/authController.js
+// Tarang 2.2.0 — controllers/authController.js
+//
+// v2.2.0 fix:
+//   generateToken now reads JWT_SECRET from process.env directly as the
+//   primary source. initJwtSecret() in server.js was regenerating a new
+//   in-memory secret on every Render cold start / redeploy, invalidating
+//   all existing tokens and causing 401 on login for returning users.
+//   Fix: if JWT_SECRET env var is set, always use it — never override it.
 
 const User              = require("../models/User");
 const { generateToken } = require("../utils/jwt");
-const { bridge }        = require("../config/bridge");
+const { bridgePost }    = require("../config/bridge");
 
 // ── POST /api/auth/register ───────────────────────────────────────────────────
 const register = async (req, res) => {
   const { name, email, password } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({
+      status: "error",
+      error:  "Name, email and password are required.",
+    });
+  }
 
   const exists = await User.findOne({ email });
   if (exists) {
@@ -24,10 +38,10 @@ const register = async (req, res) => {
     data: {
       token,
       user: {
-        id:                   user._id,
-        name:                 user.name,
-        email:                user.email,
-        role:                 user.role,
+        id:                     user._id,
+        name:                   user.name,
+        email:                  user.email,
+        role:                   user.role,
         preferredCognitiveMode: user.preferredCognitiveMode,
       },
     },
@@ -38,6 +52,13 @@ const register = async (req, res) => {
 const login = async (req, res) => {
   const { email, password } = req.body;
 
+  if (!email || !password) {
+    return res.status(400).json({
+      status: "error",
+      error:  "Email and password are required.",
+    });
+  }
+
   const user = await User.findOne({ email }).select("+password");
   if (!user || !(await user.matchPassword(password))) {
     return res.status(401).json({
@@ -46,7 +67,7 @@ const login = async (req, res) => {
     });
   }
 
-  if (!user.isActive) {
+  if (user.isActive === false) {
     return res.status(401).json({
       status: "error",
       error:  "Account is deactivated. Contact support.",
@@ -63,10 +84,10 @@ const login = async (req, res) => {
     data: {
       token,
       user: {
-        id:                   user._id,
-        name:                 user.name,
-        email:                user.email,
-        role:                 user.role,
+        id:                     user._id,
+        name:                   user.name,
+        email:                  user.email,
+        role:                   user.role,
         preferredCognitiveMode: user.preferredCognitiveMode,
       },
     },
@@ -77,7 +98,7 @@ const login = async (req, res) => {
 const getMe = async (req, res) => {
   res.json({
     status: "success",
-    data: { user: req.user },
+    data:   { user: req.user },
   });
 };
 
@@ -107,7 +128,10 @@ const updatePassword = async (req, res) => {
 const updatePreferences = async (req, res) => {
   const { themePreference } = req.body;
   if (themePreference && !["dark", "light"].includes(themePreference)) {
-    return res.status(400).json({ status: "error", error: "Invalid theme. Use 'dark' or 'light'." });
+    return res.status(400).json({
+      status: "error",
+      error:  "Invalid theme. Use 'dark' or 'light'.",
+    });
   }
   const user = await User.findByIdAndUpdate(
     req.user._id,
@@ -118,24 +142,21 @@ const updatePreferences = async (req, res) => {
 };
 
 // ── GET /api/auth/quiz ─────────────────────────────────────────────────────────
-// Proxy to bridge GET /quiz — returns personality quiz questions
 const getQuiz = async (req, res) => {
-  const { data: bridgeRes } = await bridge.get("/quiz");
+  const { data: bridgeRes } = await bridgePost("/quiz", {});
   res.json({ status: "success", data: bridgeRes.data });
 };
 
 // ── POST /api/auth/suggest-mode ───────────────────────────────────────────────
-// Proxy to bridge POST /suggest-mode — saves result to user profile
 const suggestMode = async (req, res) => {
   const { answers } = req.body;
   if (!answers || typeof answers !== "object") {
     return res.status(400).json({ status: "error", error: "answers dict is required." });
   }
 
-  const { data: bridgeRes } = await bridge.post("/suggest-mode", { answers });
+  const { data: bridgeRes } = await bridgePost("/suggest-mode", { answers });
   const result = bridgeRes.data;
 
-  // Persist result to user profile
   await User.findByIdAndUpdate(req.user._id, {
     $set: {
       preferredCognitiveMode: result.recommended_mode,
@@ -148,7 +169,6 @@ const suggestMode = async (req, res) => {
 };
 
 // ── PUT /api/auth/cognitive-mode ──────────────────────────────────────────────
-// Manual override — user picks mode from profile settings page
 const updateCognitiveMode = async (req, res) => {
   const { mode } = req.body;
   const valid = ["deep_focus", "memory", "calm", "deep_relaxation", "sleep"];

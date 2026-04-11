@@ -1,12 +1,14 @@
-// Tarang 1.0.0.1 — controllers/analyticsController.js
+// Tarang 2.2.0 — controllers/analyticsController.js
 // STATELESS: Reads session data from MongoDB, passes to bridge as dicts.
 // Bridge returns analytics + html_content string.
 // Express stores both in MongoDB Analytics collection.
+//
+// v2.2.0: uses bridgePost() (retry on 502/503) instead of bridge.post()
 
 const Analytics = require("../models/Analytics");
 const Document  = require("../models/Document");
 const Session   = require("../models/Session");
-const { bridge } = require("../config/bridge");
+const { bridgePost } = require("../config/bridge");
 
 
 // ── Helper: build all_questions and all_answer_keys from MongoDB ──────────────
@@ -21,7 +23,6 @@ const buildSessionDicts = async (docId, userId) => {
     const n = s.sessionNumber;
     all_questions[n]   = { questions: s.questions || [] };
     all_answer_keys[n] = s.answerKey || { answers: {} };
-    // Use the most recent session_state (they all share the same state)
     if (s.sessionState) session_state = s.sessionState;
   }
 
@@ -30,34 +31,33 @@ const buildSessionDicts = async (docId, userId) => {
 
 
 // ── Helper: build session_state from MongoDB Session records ──────────────────
-// Used when session_state was not stored (older documents)
 const buildSessionStateFromSessions = (sessions, doc) => {
   const state = {
-    document_id:           doc.docId,
-    document_title:        doc.title,
-    num_questions:         sessions[0]?.questions?.length || 10,
-    s1_to_s2_hours:        12.0,
-    s2_to_s3_hours:        24.0,
-    current_session:       0,
-    audio_completed_at:    null,
-    sessions:              {},
-    all_sessions_complete: doc.allSessionsComplete || false,
-    answers_unlocked:      doc.allSessionsComplete || false,
-    poor_score_warning:    false,
+    document_id:             doc.docId,
+    document_title:          doc.title,
+    num_questions:           sessions[0]?.questions?.length || 10,
+    s1_to_s2_hours:          12.0,
+    s2_to_s3_hours:          24.0,
+    current_session:         0,
+    audio_completed_at:      null,
+    sessions:                {},
+    all_sessions_complete:   doc.allSessionsComplete || false,
+    answers_unlocked:        doc.allSessionsComplete || false,
+    poor_score_warning:      false,
     relistening_recommended: false,
-    sessions_meta:         {},
-    created_at:            doc.createdAt?.toISOString() || new Date().toISOString(),
+    sessions_meta:           {},
+    created_at:              doc.createdAt?.toISOString() || new Date().toISOString(),
   };
 
   for (const s of sessions) {
     const n = s.sessionNumber.toString();
     state.sessions[n] = {
-      status:       s.status,
-      started_at:   s.startedAt?.toISOString()   || null,
-      submitted_at: s.submittedAt?.toISOString() || null,
-      score_pct:    s.scorePct    ?? null,
-      override_used:s.overrideUsed || false,
-      user_answers: s.userAnswers || {},
+      status:        s.status,
+      started_at:    s.startedAt?.toISOString()   || null,
+      submitted_at:  s.submittedAt?.toISOString() || null,
+      score_pct:     s.scorePct    ?? null,
+      override_used: s.overrideUsed || false,
+      user_answers:  s.userAnswers  || {},
     };
     if (s.scorePct !== null && s.scorePct < 0.30) {
       state.poor_score_warning      = true;
@@ -79,8 +79,8 @@ const getAnalytics = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // ── Try MongoDB cache first ───────────────────────────────────────────────
-  const cached    = await Analytics.findOne({ docId, userId: req.user._id });
+  // Try MongoDB cache first
+  const cached     = await Analytics.findOne({ docId, userId: req.user._id });
   const cacheValid = cached?.averageScorePct != null && cached?.learningCurve != null;
 
   if (cacheValid && !forceRefresh) {
@@ -93,13 +93,11 @@ const getAnalytics = async (req, res) => {
         average_score_pct:       cached.averageScorePct,
         average_score_display:   cached.averageScoreDisplay,
         average_score_label:     cached.averageScoreLabel,
-        // WRS fields
-        wrs:             cached.wrs,
-        wrs_display:     cached.wrsDisplay,
-        wrs_label:       cached.wrsLabel,
-        retention_decay: cached.retentionDecay,
-        bonuses_earned:  cached.bonusesEarned,
-        // Learning curve
+        wrs:                     cached.wrs,
+        wrs_display:             cached.wrsDisplay,
+        wrs_label:               cached.wrsLabel,
+        retention_decay:         cached.retentionDecay,
+        bonuses_earned:          cached.bonusesEarned,
         learning_curve:          cached.learningCurve,
         learning_curve_desc:     cached.learningCurveDesc,
         improvement_s1_to_s3:    cached.improvementS1toS3,
@@ -117,15 +115,14 @@ const getAnalytics = async (req, res) => {
     return res.json({ status: "success", data: { analytics: analyticsData } });
   }
 
-  // ── Generate from bridge ──────────────────────────────────────────────────
-  // Read all session data from MongoDB — pass to bridge as dicts
+  // Generate from bridge
   const { all_questions, all_answer_keys, session_state: storedState } =
     await buildSessionDicts(docId, req.user._id);
 
-  const sessions     = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
+  const sessions      = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
   const session_state = storedState || buildSessionStateFromSessions(sessions, doc);
 
-  const { data: bridgeRes } = await bridge.post("/analytics", {
+  const { data: bridgeRes } = await bridgePost("/analytics", {
     doc_id:          docId,
     role:            req.user.role,
     session_state,
@@ -135,39 +132,35 @@ const getAnalytics = async (req, res) => {
 
   const { analytics: ad, html_content } = bridgeRes.data;
 
-  // ── Cache in MongoDB ──────────────────────────────────────────────────────
   if (ad?.summary) {
     try {
       await Analytics.findOneAndUpdate(
         { docId, userId: req.user._id },
         {
-          userId:                req.user._id,
-          documentId:            doc._id,
+          userId:                 req.user._id,
+          documentId:             doc._id,
           docId,
-          // Flat average
-          averageScorePct:       ad.summary.average_score_pct,
-          averageScoreDisplay:   ad.summary.average_score_display,
-          averageScoreLabel:     ad.summary.average_score_label,
-          // WRS
-          wrs:                   ad.summary.wrs            ?? null,
-          wrsDisplay:            ad.summary.wrs_display    ?? null,
-          wrsLabel:              ad.summary.wrs_label      ?? null,
-          retentionDecay:        ad.summary.retention_decay ?? null,
-          bonusesEarned:         ad.summary.bonuses_earned  ?? [],
-          // Learning curve
-          learningCurve:         ad.summary.learning_curve,
-          learningCurveDesc:     ad.summary.learning_curve_desc,
-          improvementS1toS3:     ad.summary.improvement_s1_to_s3,
-          totalTimeSpentMin:     ad.summary.total_time_spent_min,
-          bestSession:           ad.summary.best_session,
-          worstSession:          ad.summary.worst_session,
-          scoreProgression:      ad.score_progression,
-          weakTopics:            ad.weak_topics,
-          suggestions:           ad.suggestions,
-          relisteningRecommended:ad.summary.relistening_recommended,
-          poorScoreWarning:      ad.summary.poor_score_warning,
-          fullAnalytics:         ad,
-          analyticsHtml:         html_content,
+          averageScorePct:        ad.summary.average_score_pct,
+          averageScoreDisplay:    ad.summary.average_score_display,
+          averageScoreLabel:      ad.summary.average_score_label,
+          wrs:                    ad.summary.wrs             ?? null,
+          wrsDisplay:             ad.summary.wrs_display     ?? null,
+          wrsLabel:               ad.summary.wrs_label       ?? null,
+          retentionDecay:         ad.summary.retention_decay ?? null,
+          bonusesEarned:          ad.summary.bonuses_earned  ?? [],
+          learningCurve:          ad.summary.learning_curve,
+          learningCurveDesc:      ad.summary.learning_curve_desc,
+          improvementS1toS3:      ad.summary.improvement_s1_to_s3,
+          totalTimeSpentMin:      ad.summary.total_time_spent_min,
+          bestSession:            ad.summary.best_session,
+          worstSession:           ad.summary.worst_session,
+          scoreProgression:       ad.score_progression,
+          weakTopics:             ad.weak_topics,
+          suggestions:            ad.suggestions,
+          relisteningRecommended: ad.summary.relistening_recommended,
+          poorScoreWarning:       ad.summary.poor_score_warning,
+          fullAnalytics:          ad,
+          analyticsHtml:          html_content,
         },
         { upsert: true, new: true }
       );
@@ -181,7 +174,6 @@ const getAnalytics = async (req, res) => {
 
 
 // ── GET /api/analytics/:docId/report ─────────────────────────────────────────
-// Returns the HTML analytics report stored in MongoDB as a rendered HTML page
 const getAnalyticsReport = async (req, res) => {
   const { docId } = req.params;
 
@@ -198,7 +190,6 @@ const getAnalyticsReport = async (req, res) => {
     });
   }
 
-  // Serve as rendered HTML page
   res.setHeader("Content-Type", "text/html");
   res.send(analytics.analyticsHtml);
 };
@@ -211,7 +202,7 @@ const getAllAnalytics = async (req, res) => {
     .populate("documentId", "title format")
     .sort({ createdAt: -1 })
     .limit(100)
-    .select("-fullAnalytics -analyticsHtml"); // don't send huge payloads in list
+    .select("-fullAnalytics -analyticsHtml");
 
   res.json({ status: "success", data: { analytics } });
 };

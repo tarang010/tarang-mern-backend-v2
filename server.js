@@ -12,8 +12,9 @@
 require("dotenv").config();
 require("express-async-errors");
 
+// initJwtSecret is now async (reads from MongoDB).
+// It is called inside start() below — after connectDB() — so MongoDB is ready.
 const { initJwtSecret } = require("./utils/jwtSecret");
-initJwtSecret();
 
 const express     = require("express");
 const cors        = require("cors");
@@ -198,6 +199,9 @@ app.use(errorHandler);
 // ── Start server ──────────────────────────────────────────────────────────────
 const start = async () => {
   await connectDB();
+
+  // initJwtSecret MUST run after connectDB — it needs MongoDB to read/write the secret
+  await initJwtSecret();
 
   const bridgeAlive = await pingBridge();
   if (!bridgeAlive) {
