@@ -15,7 +15,7 @@
 const Document  = require("../models/Document");
 const Session   = require("../models/Session");
 const Analytics = require("../models/Analytics");
-const { bridge, bridgePost } = require("../config/bridge");
+const { bridge, bridgePost, wakeBridge } = require("../config/bridge");
 
 // ── In-flight dedup + short-TTL cache for getStatus ──────────────────────────
 // Key: `${docId}:${userId}`
@@ -136,6 +136,11 @@ const audioDone = async (req, res) => {
   if (!session_state) {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
+
+  // FIX v2.2.1: wake bridge before calling it.
+  // User may click "I've listened" hours after upload — bridge is cold by then.
+  // wakeBridge() polls /health until the Python pod responds (up to 2 min).
+  await wakeBridge();
 
   const { data } = await bridgePost("/mcq/audio-completed", {
     doc_id:        docId,

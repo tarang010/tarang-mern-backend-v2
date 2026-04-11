@@ -9,7 +9,7 @@
 
 const User              = require("../models/User");
 const { generateToken } = require("../utils/jwt");
-const { bridgePost }    = require("../config/bridge");
+const { bridge, bridgePost } = require("../config/bridge");
 
 // ── POST /api/auth/register ───────────────────────────────────────────────────
 const register = async (req, res) => {
@@ -142,8 +142,9 @@ const updatePreferences = async (req, res) => {
 };
 
 // ── GET /api/auth/quiz ─────────────────────────────────────────────────────────
+// FIX v2.2.1: bridge /quiz is GET — bridgePost was sending POST → 405.
 const getQuiz = async (req, res) => {
-  const { data: bridgeRes } = await bridgePost("/quiz", {});
+  const { data: bridgeRes } = await bridge.get("/quiz");
   res.json({ status: "success", data: bridgeRes.data });
 };
 
