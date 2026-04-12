@@ -132,15 +132,38 @@ const audioDone = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  const session_state = await getSessionState(docId, req.user._id);
-  if (!session_state) {
-    return res.status(404).json({ status: "error", error: "Session state not found." });
-  }
-
-  // FIX v2.2.1: wake bridge before calling it.
-  // User may click "I've listened" hours after upload — bridge is cold by then.
-  // wakeBridge() polls /health until the Python pod responds (up to 2 min).
+  // Wake bridge first — user may click "I've listened" hours after upload
   await wakeBridge();
+
+  let session_state = await getSessionState(docId, req.user._id);
+
+  // FIX v2.2.2: MCQ generation runs in background and may not be done yet
+  // when the user finishes listening. audio-done does NOT require sessions —
+  // it just marks that audio was heard. Bootstrap a minimal state so the
+  // bridge call succeeds. Sessions populate when MCQ generation completes.
+  if (!session_state) {
+    console.log(`[audioDone] MCQ not yet generated for ${docId} — bootstrapping state`);
+    session_state = {
+      document_id:             docId,
+      document_title:          doc.title || "",
+      num_questions:           10,
+      s1_to_s2_hours:          12.0,
+      s2_to_s3_hours:          24.0,
+      current_session:         0,
+      audio_completed_at:      null,
+      sessions: {
+        "1": { status: "pending",  started_at: null, submitted_at: null, score_pct: null, override_used: false, user_answers: {} },
+        "2": { status: "locked",   started_at: null, submitted_at: null, score_pct: null, override_used: false, user_answers: {} },
+        "3": { status: "locked",   started_at: null, submitted_at: null, score_pct: null, override_used: false, user_answers: {} },
+      },
+      all_sessions_complete:   false,
+      answers_unlocked:        false,
+      poor_score_warning:      false,
+      relistening_recommended: false,
+      sessions_meta:           {},
+      created_at:              new Date().toISOString(),
+    };
+  }
 
   const { data } = await bridgePost("/mcq/audio-completed", {
     doc_id:        docId,
