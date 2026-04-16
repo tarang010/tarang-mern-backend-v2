@@ -4,6 +4,8 @@
 // Express stores both in MongoDB Analytics collection.
 //
 // v2.2.0: uses bridgePost() (retry on 502/503) instead of bridge.post()
+// FIX: removed stale poor_score_warning propagation from buildSessionStateFromSessions
+//      so bridge always computes relistening_recommended fresh from actual submission scores.
 
 const Analytics = require("../models/Analytics");
 const Document  = require("../models/Document");
@@ -43,6 +45,9 @@ const buildSessionStateFromSessions = (sessions, doc) => {
     sessions:                {},
     all_sessions_complete:   doc.allSessionsComplete || false,
     answers_unlocked:        doc.allSessionsComplete || false,
+    // FIX: do NOT pre-populate poor_score_warning / relistening_recommended from
+    //      historical sessions. The bridge must compute these fresh from the live
+    //      submission so a good score (e.g. 70%) is never incorrectly flagged.
     poor_score_warning:      false,
     relistening_recommended: false,
     sessions_meta:           {},
@@ -59,10 +64,14 @@ const buildSessionStateFromSessions = (sessions, doc) => {
       override_used: s.overrideUsed || false,
       user_answers:  s.userAnswers  || {},
     };
-    if (s.scorePct !== null && s.scorePct < 0.30) {
-      state.poor_score_warning      = true;
-      state.relistening_recommended = true;
-    }
+    // FIX REMOVED: the old block below was poisoning session_state for every
+    //              subsequent submission, causing the bridge to echo
+    //              relistening_recommended: true even when the new score was fine.
+    //
+    // if (s.scorePct !== null && s.scorePct < 0.30) {
+    //   state.poor_score_warning      = true;
+    //   state.relistening_recommended = true;
+    // }
   }
 
   return state;
@@ -81,7 +90,7 @@ const getAnalytics = async (req, res) => {
 
   // Try MongoDB cache first
   const cached     = await Analytics.findOne({ docId, userId: req.user._id });
-  const cacheValid = cached?.averageScorePct != null && cached?.learningCurve != null;
+  const cacheValid = cached?.averageScorePct != null && cached?.averageScorePct > 0 && cached?.learningCurve != null;
 
   if (cacheValid && !forceRefresh) {
     const analyticsData = cached.fullAnalytics || {

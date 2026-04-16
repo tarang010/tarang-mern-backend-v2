@@ -1,5 +1,7 @@
 // Tarang 1.0.0.1 — controllers/adminController.js
 // Admin-only endpoints
+// FIX: platform average score now excludes analytics docs where averageScorePct = 0
+//      (incomplete sessions produce 0, skewing the aggregate down to near-zero)
 
 const User      = require("../models/User");
 const Document  = require("../models/Document");
@@ -84,7 +86,12 @@ const getStats = async (req, res) => {
     Analytics.countDocuments(),
   ]);
 
+  // FIX: exclude docs where averageScorePct is 0 or null — these are analytics
+  //      records written during incomplete sessions (session 1 or 2 submissions)
+  //      where the bridge hasn't yet computed a real final average. Including them
+  //      dragged the platform average down to ~0%.
   const avgScore = await Analytics.aggregate([
+    { $match: { averageScorePct: { $gt: 0 } } },
     { $group: { _id: null, avg: { $avg: "$averageScorePct" } } },
   ]);
 

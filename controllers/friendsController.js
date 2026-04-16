@@ -1,4 +1,7 @@
 // Tarang 1.0.0.1 — controllers/friendsController.js
+// FIX: leaderboard avgScoreRanking now skips analytics docs where averageScorePct
+//      is 0 or null (written during incomplete sessions), preventing users from
+//      appearing as 0% on the leaderboard before they finish all 3 sessions.
 
 const mongoose  = require("mongoose");
 const User       = require("../models/User");
@@ -184,23 +187,25 @@ const getLeaderboard = async (req, res) => {
     const uid = a.userId._id.toString();
     if (!avgScoreMap[uid]) {
       avgScoreMap[uid] = {
-        user:        a.userId,
-        scores:      [],
-        totalDocs:   0,
+        user:      a.userId,
+        scores:    [],
+        totalDocs: 0,
       };
     }
-    if (a.scorePct != null) {
-      avgScoreMap[uid].scores.push(a.scorePct);
+    // FIX: skip analytics docs where averageScorePct is 0 or null — these are
+    //      intermediate records written after session 1 or 2 before the bridge
+    //      has computed a real final score. Including them showed everyone as 0%.
+    if (a.averageScorePct != null && a.averageScorePct > 0) {
+      avgScoreMap[uid].scores.push(a.averageScorePct);
       avgScoreMap[uid].totalDocs++;
     }
   }
 
   const avgScoreRanking = Object.values(avgScoreMap)
+    .filter((entry) => entry.scores.length > 0) // only show users with real scores
     .map((entry) => ({
       user:      entry.user,
-      avgScore:  entry.scores.length > 0
-        ? parseFloat((entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length * 100).toFixed(1))
-        : 0,
+      avgScore:  parseFloat((entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length * 100).toFixed(1)),
       totalDocs: entry.totalDocs,
       isMe:      entry.user._id.toString() === myId.toString(),
     }))
@@ -234,12 +239,13 @@ const getLeaderboard = async (req, res) => {
   // ── Ranking 3: Per-document (friends who studied same docs) ───────────────
   const docMap = {}; // docId → [{ user, avgScore }]
   for (const a of analyticsData) {
-    if (a.scorePct == null) continue;
+    // FIX: also skip zero scores here for per-doc ranking
+    if (a.averageScorePct == null || a.averageScorePct <= 0) continue;
     if (!docMap[a.docId]) docMap[a.docId] = { title: null, entries: [] };
     docMap[a.docId].entries.push({
-      user:     a.userId,
-      score:    parseFloat((a.scorePct * 100).toFixed(1)),
-      isMe:     a.userId._id.toString() === myId.toString(),
+      user:  a.userId,
+      score: parseFloat((a.averageScorePct * 100).toFixed(1)),
+      isMe:  a.userId._id.toString() === myId.toString(),
     });
   }
 
