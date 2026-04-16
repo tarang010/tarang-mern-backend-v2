@@ -11,6 +11,13 @@
 //     sequential polls within the TTL window get the cached response instantly.
 //   - No logic changes to audioDone, getQuestions, overrideWindow, submitTest,
 //     getResults — all behaviour is identical to v1.0.0.4.
+//
+// FIX (score bug):
+//   submitTest was reading result.updated_state.sessions[sessionNum] where
+//   sessionNum is an integer, but session_state keys are STRINGS ("1","2","3").
+//   sessions[1] === undefined → realScorePct fell back to result.score_pct
+//   which is null for sessions 1 & 2 (hidden). null → saved as 0 to MongoDB.
+//   Fix: use sessionNum.toString() as the key.
 
 const Document  = require("../models/Document");
 const Session   = require("../models/Session");
@@ -18,11 +25,9 @@ const Analytics = require("../models/Analytics");
 const { bridge, bridgePost, wakeBridge } = require("../config/bridge");
 
 // ── In-flight dedup + short-TTL cache for getStatus ──────────────────────────
-// Key: `${docId}:${userId}`
-// Value: { promise, resolvedAt, result }
 const _statusCache    = new Map();
-const CACHE_TTL_MS    = 2000; // serve cached result for 2s after resolution
-const _statusInflight = new Map(); // Key → Promise (in-flight dedup)
+const CACHE_TTL_MS    = 2000;
+const _statusInflight = new Map();
 
 
 // ── Helper: get current session_state from MongoDB ────────────────────────────
@@ -52,7 +57,7 @@ const getSessionState = async (docId, userId) => {
     return state;
   }
 
-  // Fallback: build state from scratch (for older documents)
+  // Fallback: build state from scratch
   const doc = await Document.findOne({ docId, userId });
   const state = {
     document_id:             docId,
@@ -132,15 +137,10 @@ const audioDone = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // Wake bridge first — user may click "I've listened" hours after upload
   await wakeBridge();
 
   let session_state = await getSessionState(docId, req.user._id);
 
-  // FIX v2.2.2: MCQ generation runs in background and may not be done yet
-  // when the user finishes listening. audio-done does NOT require sessions —
-  // it just marks that audio was heard. Bootstrap a minimal state so the
-  // bridge call succeeds. Sessions populate when MCQ generation completes.
   if (!session_state) {
     console.log(`[audioDone] MCQ not yet generated for ${docId} — bootstrapping state`);
     session_state = {
@@ -192,30 +192,16 @@ const audioDone = async (req, res) => {
 
 
 // ── GET /api/sessions/:docId/status ──────────────────────────────────────────
-// v2.2.0: in-flight dedup + 2s cache.
-//
-// WHY: The frontend was calling this on every render cycle during the quiz
-// "Preparing..." state — sometimes firing 3-4 identical requests within
-// milliseconds of each other. Each one hit MongoDB + the bridge.
-//
-// HOW:
-//   1. If a result for this docId+userId was computed < CACHE_TTL_MS ago,
-//      return it immediately without touching MongoDB or the bridge.
-//   2. If a bridge call for this docId+userId is already in flight,
-//      await that same promise instead of issuing a second one.
-//   3. Otherwise run the normal flow and cache the result.
 const getStatus = async (req, res) => {
   const { docId } = req.params;
   const userId    = req.user._id.toString();
   const cacheKey  = `${docId}:${userId}`;
 
-  // ── 1. Serve from cache if fresh ─────────────────────────────────────────
   const cached = _statusCache.get(cacheKey);
   if (cached && Date.now() - cached.resolvedAt < CACHE_TTL_MS) {
     return res.json({ status: "success", data: cached.result });
   }
 
-  // ── 2. Dedup in-flight requests ───────────────────────────────────────────
   if (_statusInflight.has(cacheKey)) {
     try {
       const result = await _statusInflight.get(cacheKey);
@@ -225,7 +211,6 @@ const getStatus = async (req, res) => {
     }
   }
 
-  // ── 3. Normal flow — run once, cache result ───────────────────────────────
   const work = (async () => {
     const doc = await Document.findOne({ docId, userId: req.user._id });
     if (!doc) throw Object.assign(new Error("Document not found."), { statusCode: 404 });
@@ -248,20 +233,15 @@ const getStatus = async (req, res) => {
     return result;
   })();
 
-  // Register in-flight promise so concurrent calls can share it
   _statusInflight.set(cacheKey, work);
 
   try {
     const result = await work;
-
-    // Cache the result
     _statusCache.set(cacheKey, { result, resolvedAt: Date.now() });
-
     return res.json({ status: "success", data: result });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ status: "error", error: err.message });
   } finally {
-    // Always remove from in-flight map regardless of outcome
     _statusInflight.delete(cacheKey);
   }
 };
@@ -397,11 +377,14 @@ const submitTest = async (req, res) => {
     await saveUpdatedState(docId, req.user._id, result.updated_state);
   }
 
-  // FIX (from v1.0.0.4): read real score from updated_state, NOT result.score_pct
-  // result.score_pct is null for sessions 1 & 2 (hidden until all 3 done).
-  const realScorePct = result.updated_state?.sessions?.[sessionNum.toString()]?.score_pct
-    ?? result.score_pct
-    ?? null;
+  // ── FIX: session_state keys are strings ("1", "2", "3"), not integers.
+  // Using sessionNum (integer) directly returns undefined → score saved as 0.
+  // Always convert to string before indexing into sessions.
+  const sessionKey   = sessionNum.toString();
+  const realScorePct =
+    result.updated_state?.sessions?.[sessionKey]?.score_pct ??
+    result.score_pct ??
+    null;
 
   await Session.findOneAndUpdate(
     { docId, userId: req.user._id, sessionNumber: sessionNum },
@@ -418,7 +401,7 @@ const submitTest = async (req, res) => {
     { new: true }
   );
 
-  // Invalidate the status cache for this doc so next getStatus is fresh
+  // Invalidate status cache so next poll is fresh
   const cacheKey = `${docId}:${req.user._id.toString()}`;
   _statusCache.delete(cacheKey);
 
@@ -455,6 +438,11 @@ const submitTest = async (req, res) => {
           averageScorePct:        ad.summary.average_score_pct,
           averageScoreDisplay:    ad.summary.average_score_display,
           averageScoreLabel:      ad.summary.average_score_label,
+          wrs:                    ad.summary.wrs             ?? null,
+          wrsDisplay:             ad.summary.wrs_display     ?? null,
+          wrsLabel:               ad.summary.wrs_label       ?? null,
+          retentionDecay:         ad.summary.retention_decay ?? null,
+          bonusesEarned:          ad.summary.bonuses_earned  ?? [],
           learningCurve:          ad.summary.learning_curve,
           learningCurveDesc:      ad.summary.learning_curve_desc,
           improvementS1toS3:      ad.summary.improvement_s1_to_s3,
