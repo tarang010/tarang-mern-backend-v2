@@ -189,8 +189,8 @@ const getLeaderboard = async (req, res) => {
         totalDocs:   0,
       };
     }
-    if (a.averageScorePct != null) {
-      avgScoreMap[uid].scores.push(a.averageScorePct);
+    if (a.scorePct != null) {
+      avgScoreMap[uid].scores.push(a.scorePct);
       avgScoreMap[uid].totalDocs++;
     }
   }
@@ -234,11 +234,11 @@ const getLeaderboard = async (req, res) => {
   // ── Ranking 3: Per-document (friends who studied same docs) ───────────────
   const docMap = {}; // docId → [{ user, avgScore }]
   for (const a of analyticsData) {
-    if (a.averageScorePct == null) continue;
+    if (a.scorePct == null) continue;
     if (!docMap[a.docId]) docMap[a.docId] = { title: null, entries: [] };
     docMap[a.docId].entries.push({
       user:     a.userId,
-      score:    parseFloat((a.averageScorePct * 100).toFixed(1)),
+      score:    parseFloat((a.scorePct * 100).toFixed(1)),
       isMe:     a.userId._id.toString() === myId.toString(),
     });
   }
