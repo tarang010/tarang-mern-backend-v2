@@ -12,9 +12,17 @@
 //                       FULL DOCUMENT as one continuous string.
 //                       7200 words → correctly splits into 2 parts. ← FIX
 //
-//   Fix: use raw_text for splitting. pipeline/audio re-runs its own TTS
-//   optimization on each part internally — audio quality is identical.
-//   Word count is computed from raw_text directly, never from bridge's report.
+//   The bug was in bridge.py — the /extract endpoint was NOT returning raw_text
+//   at all. This controller already had the correct fallback logic:
+//     const splitSource = extractRes.data.raw_text || extractRes.data.text;
+//   But since raw_text was undefined, it always fell back to data.text (bug path).
+//
+//   Fix: bridge.py v2.0.1 now exposes raw_text in the /extract response.
+//   This controller reads it correctly. A defensive guard is added below
+//   to log a clear error if raw_text is ever missing again in future.
+//
+//   Word count displayed on dashboard now comes from raw_text word count,
+//   not from the bridge's reported word_count (which counted optimized prose).
 //
 // OTHER FIXES retained from 2.4.1:
 //   • PART_WORD_MARGIN: docs within 100 words of limit stay as single part
@@ -64,6 +72,12 @@ const waitForBridgeFree = async (docId) => {
 // ── Text splitter ─────────────────────────────────────────────────────────────
 // Splits raw continuous text at sentence boundaries.
 // Docs within (limit + margin) words stay as a single part.
+//
+// IMPORTANT: This function must receive raw_text (sanitize_text() output),
+// NOT the optimized text (optimize_for_presentation() output).
+// The optimized text is paragraph-split by \n\n into ~200-word chunks,
+// which causes this function to see 36 "words groups" instead of the
+// full continuous 7200-word document — resulting in 19 parts instead of 2.
 const splitTextIntoParts = (text, wordLimit, margin = 0) => {
   const words = text.trim().split(/\s+/);
 
@@ -120,6 +134,8 @@ const processOnePart = async ({
   const form     = new FormData();
   const partWords = partText.trim().split(/\s+/).length;
 
+  // Send the raw part text as a .txt file so bridge's pipeline/audio
+  // can run TTS optimization on it internally
   const partBuffer = Buffer.from(partText, "utf-8");
   form.append("file", partBuffer, { filename: `${partDocId}.txt`, contentType: "text/plain" });
   form.append("cognitive_state", cognitiveState);
@@ -272,19 +288,30 @@ const uploadDocument = async (req, res) => {
       }
 
       // ── ROOT CAUSE FIX ────────────────────────────────────────────────────
-      // WRONG (previous):  extractRes.data.text
+      // WRONG (caused 19-parts bug):  extractRes.data.text
       //   → optimize_for_presentation() output
       //   → paragraph-split into ~200-word chunks separated by \n\n
-      //   → splitTextIntoParts() splits each paragraph → 19 tiny parts
+      //   → splitTextIntoParts() splits EACH PARAGRAPH as if it were a document
+      //   → 7200-word PDF → 36 paragraphs → 19 "parts" of ~180-200 words each
       //
-      // CORRECT (now):     extractRes.data.raw_text
-      //   → sanitize_text() output — one continuous string
-      //   → splitTextIntoParts() correctly splits at ~3800 words
-      //   → 7200-word doc → 2 parts as expected
+      // CORRECT (fixed):              extractRes.data.raw_text
+      //   → sanitize_text() output — one continuous string, no \n\n splitting
+      //   → splitTextIntoParts() sees the full 7200-word document
+      //   → 7200 words → correctly split into 2 parts of ~3600 words each
       //
-      // pipeline/audio receives each raw part and runs its own TTS
-      // optimization internally — audio quality is unchanged.
+      // bridge.py v2.0.1 now exposes raw_text in the /extract response.
+      // The || fallback to data.text is kept for safety but should never trigger.
+      //
       const splitSource = extractRes.data.raw_text || extractRes.data.text;
+
+      // Defensive guard: warn clearly if raw_text is missing (bridge not updated)
+      if (!extractRes.data.raw_text) {
+        console.error(
+          `✗ CRITICAL: Bridge did not return raw_text for docId=${part1DocId}. ` +
+          `Falling back to data.text — this WILL cause incorrect part splitting! ` +
+          `Please update bridge.py to v2.0.1.`
+        );
+      }
 
       if (!splitSource || !splitSource.trim()) {
         throw new Error("Extraction returned empty text");
@@ -360,7 +387,7 @@ const uploadDocument = async (req, res) => {
         return;
       }
 
-      // ── Step 4: Parts 2..N — fire and forget ──────────────────────────────
+      // ── Step 4: Parts 2..N — processed sequentially after part 1 ─────────
       if (totalParts > 1) {
         for (let i = 1; i < totalParts; i++) {
           const partDocId = partDocIds[i];
