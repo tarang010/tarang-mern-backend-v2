@@ -1,26 +1,26 @@
-// Tarang 2.4.1 — controllers/documentController.js
+// Tarang 2.4.2 — controllers/documentController.js
 //
-// FIXES vs 2.4.0:
+// ROOT CAUSE FIX for 19-parts bug:
 //
-//   1. SPLITTING BUG: The bridge /extract response was being passed directly
-//      to splitTextIntoParts without verifying the text is the FULL document.
-//      Now we assert word_count matches before splitting. Also added a
-//      PART_WORD_MARGIN (100 words) so a 3900-word doc stays as one part.
+//   The bridge /extract endpoint returns TWO text fields:
+//     • data.text     = optimize_for_presentation(clean_text)
+//                       PARAGRAPH-SPLIT prose. Each section ~200 words separated
+//                       by \n\n. A 7200-word PDF becomes ~36 paragraphs.
+//                       splitTextIntoParts() saw 36 chunks → made 19 "parts". ← BUG
 //
-//   2. REDIRECT SIGNAL: The pre-created Document record now carries a
-//      `isMultiPart` flag that is set correctly BEFORE the 202 response so
-//      the frontend knows immediately whether to go to audio player or dashboard.
-//      Additionally, after part-1 audio is ready, Document gets
-//      `frontendRedirectTarget: "dashboard" | "audio_player"` so the frontend
-//      poll can make the right routing decision without guessing.
+//     • data.raw_text = sanitize_text(clean_text)
+//                       FULL DOCUMENT as one continuous string.
+//                       7200 words → correctly splits into 2 parts. ← FIX
 //
-//   3. UPLOAD PAGE ERROR: pollDocumentStatus was resolving on "audio_ready"
-//      but UploadPage.jsx navigated to /listen/:docId — which is correct for
-//      single-part. For multi-part we now set a redirect flag and the frontend
-//      reads it. See UploadPage.jsx changes.
+//   Fix: use raw_text for splitting. pipeline/audio re-runs its own TTS
+//   optimization on each part internally — audio quality is identical.
+//   Word count is computed from raw_text directly, never from bridge's report.
 //
-//   4. SEQUENTIAL INTEGRITY: Parts 2..N are now truly fire-and-forget after
-//      part 1 resolves — they do NOT block the response or the redirect.
+// OTHER FIXES retained from 2.4.1:
+//   • PART_WORD_MARGIN: docs within 100 words of limit stay as single part
+//   • frontendRedirectTarget: "audio_player" vs "dashboard"
+//   • Part 1 processed first to unblock frontend redirect
+//   • Parts 2..N fire-and-forget after part 1 is audio_ready
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
@@ -28,13 +28,11 @@ const { bridge, bridgePost, wakeBridge } = require("../config/bridge");
 const { uploadAudioBuffer, isConfigured } = require("../config/cloudinary");
 
 const PIPELINE_TIMEOUT_MS     = 20 * 60 * 1000;
-const SSE_POLL_INTERVAL_MS    = parseInt(process.env.SSE_POLL_INTERVAL_MS   || "3000",  10);
-const SSE_TIMEOUT_MS          = parseInt(process.env.SSE_TIMEOUT_MS         || String(10 * 60 * 1000), 10);
+const SSE_POLL_INTERVAL_MS    = parseInt(process.env.SSE_POLL_INTERVAL_MS    || "3000",  10);
+const SSE_TIMEOUT_MS          = parseInt(process.env.SSE_TIMEOUT_MS          || String(10 * 60 * 1000), 10);
 const BRIDGE_BUSY_MAX_WAIT_MS = parseInt(process.env.BRIDGE_BUSY_MAX_WAIT_MS || String(18 * 60 * 1000), 10);
-const BRIDGE_BUSY_POLL_MS     = parseInt(process.env.BRIDGE_BUSY_POLL_MS    || "8000", 10);
+const BRIDGE_BUSY_POLL_MS     = parseInt(process.env.BRIDGE_BUSY_POLL_MS     || "8000", 10);
 
-// FIX 1: Added PART_WORD_MARGIN — docs within margin of limit stay as single part.
-// A 3900-word doc with limit=3800 and margin=100 → stays as ONE part.
 const PART_WORD_LIMIT  = parseInt(process.env.TARANG_PART_WORD_LIMIT  || "3800", 10);
 const PART_WORD_MARGIN = parseInt(process.env.TARANG_PART_WORD_MARGIN || "100",  10);
 
@@ -64,11 +62,11 @@ const waitForBridgeFree = async (docId) => {
 
 
 // ── Text splitter ─────────────────────────────────────────────────────────────
-// FIX 1: Added margin parameter. Docs within (limit + margin) stay as one part.
+// Splits raw continuous text at sentence boundaries.
+// Docs within (limit + margin) words stay as a single part.
 const splitTextIntoParts = (text, wordLimit, margin = 0) => {
   const words = text.trim().split(/\s+/);
 
-  // Within margin → treat as single part, no split
   if (words.length <= wordLimit + margin) return [text];
 
   const parts = [];
@@ -110,27 +108,17 @@ const makeDocId = (seed) => {
 };
 
 
-// ── Process one part through pipeline/audio → Cloudinary → DB update ─────────
+// ── Process one part through pipeline/audio → Cloudinary → DB ────────────────
 const processOnePart = async ({
-  partText,
-  partDocId,
-  partTitle,
-  cognitiveState,
-  ttsEngine,
-  voiceId,
-  userRole,
-  userId,
-  originalFilename,
-  format,
-  partNumber,
-  totalParts,
-  parentDocId,
+  partText, partDocId, partTitle, cognitiveState, ttsEngine, voiceId,
+  userRole, userId, originalFilename, format, partNumber, totalParts, parentDocId,
 }) => {
   const free = await waitForBridgeFree(partDocId);
   if (!free) throw new Error("Bridge was busy for too long.");
 
   const FormData = require("form-data");
   const form     = new FormData();
+  const partWords = partText.trim().split(/\s+/).length;
 
   const partBuffer = Buffer.from(partText, "utf-8");
   form.append("file", partBuffer, { filename: `${partDocId}.txt`, contentType: "text/plain" });
@@ -140,7 +128,8 @@ const processOnePart = async ({
   form.append("role",            userRole);
   if (voiceId) form.append("voice_id", voiceId);
 
-  console.log(`→ Bridge /pipeline/audio | part=${partNumber}/${totalParts} | docId=${partDocId}`);
+  console.log(`→ Bridge /pipeline/audio | part=${partNumber}/${totalParts} | docId=${partDocId} | words=${partWords}`);
+
   const { data: bridgeRes } = await bridge.post("/pipeline/audio", form, {
     headers:          form.getHeaders(),
     maxContentLength: Infinity,
@@ -168,8 +157,6 @@ const processOnePart = async ({
     }
   }
 
-  // FIX 2: Set frontendRedirectTarget so SSE/poll clients know where to go
-  // after part 1 is ready — "audio_player" for single-part, "dashboard" for multi.
   const redirectTarget = totalParts === 1 ? "audio_player" : "dashboard";
 
   await Document.findOneAndUpdate(
@@ -195,7 +182,7 @@ const processOnePart = async ({
         originalFilename,
         cognitiveState,
         ttsEngine,
-        frontendRedirectTarget: redirectTarget,  // ← NEW
+        frontendRedirectTarget: redirectTarget,
       }
     },
     { upsert: true, new: true }
@@ -225,21 +212,20 @@ const uploadDocument = async (req, res) => {
     { docId: part1DocId, userId: req.user._id },
     {
       $set: {
-        userId:            req.user._id,
-        docId:             part1DocId,
-        title:             documentTitle,
-        originalFilename:  req.file.originalname,
-        format:            req.file.originalname.split(".").pop().toLowerCase(),
+        userId:                 req.user._id,
+        docId:                  part1DocId,
+        title:                  documentTitle,
+        originalFilename:       req.file.originalname,
+        format:                 req.file.originalname.split(".").pop().toLowerCase(),
         cognitiveState,
         ttsEngine,
-        pipelineStatus:    "processing",
-        pipelineError:     null,
-        sessionsGenerated: 0,
-        partNumber:        1,
-        totalParts:        1,
-        isMultiPart:       false,
-        parentDocId:       null,
-        // FIX 2: default redirect — will be overwritten once we know totalParts
+        pipelineStatus:         "processing",
+        pipelineError:          null,
+        sessionsGenerated:      0,
+        partNumber:             1,
+        totalParts:             1,
+        isMultiPart:            false,
+        parentDocId:            null,
         frontendRedirectTarget: "audio_player",
       }
     },
@@ -250,11 +236,7 @@ const uploadDocument = async (req, res) => {
 
   res.status(202).json({
     status: "success",
-    data: {
-      document: doc,
-      phase:    "processing",
-      message:  "Upload received. Processing in background.",
-    },
+    data: { document: doc, phase: "processing", message: "Upload received. Processing in background." },
   });
 
   const fileBuffer   = req.file.buffer;
@@ -267,14 +249,13 @@ const uploadDocument = async (req, res) => {
   setImmediate(async () => {
     try {
       console.log(`→ Background START | docId=${part1DocId}`);
-
       await wakeBridge();
 
-      // ── Step 1: Extract full text ─────────────────────────────────────────
+      // ── Step 1: Extract ───────────────────────────────────────────────────
       const free = await waitForBridgeFree(part1DocId);
       if (!free) throw new Error("Bridge busy — cannot extract.");
 
-      const FormData   = require("form-data");
+      const FormData    = require("form-data");
       const extractForm = new FormData();
       extractForm.append("file", fileBuffer, { filename: fileOrigName, contentType: fileMimetype });
 
@@ -290,47 +271,50 @@ const uploadDocument = async (req, res) => {
         throw new Error(extractRes.error || "Extraction failed");
       }
 
-      const fullText  = extractRes.data.text;
-      const wordCount = extractRes.data.word_count;
+      // ── ROOT CAUSE FIX ────────────────────────────────────────────────────
+      // WRONG (previous):  extractRes.data.text
+      //   → optimize_for_presentation() output
+      //   → paragraph-split into ~200-word chunks separated by \n\n
+      //   → splitTextIntoParts() splits each paragraph → 19 tiny parts
+      //
+      // CORRECT (now):     extractRes.data.raw_text
+      //   → sanitize_text() output — one continuous string
+      //   → splitTextIntoParts() correctly splits at ~3800 words
+      //   → 7200-word doc → 2 parts as expected
+      //
+      // pipeline/audio receives each raw part and runs its own TTS
+      // optimization internally — audio quality is unchanged.
+      const splitSource = extractRes.data.raw_text || extractRes.data.text;
 
-      // FIX 1: CRITICAL INTEGRITY CHECK
-      // The bridge must return the complete document text in one string.
-      // If word_count mismatches the actual text length, abort splitting to
-      // prevent the 19-tiny-parts bug where the bridge returned pre-chunked data.
-      const actualWords = fullText.trim().split(/\s+/).length;
-      if (Math.abs(actualWords - wordCount) > wordCount * 0.15) {
-        console.warn(
-          `⚠ word_count mismatch: bridge says ${wordCount}, actual=${actualWords} | ` +
-          `Using actual count for splitting | docId=${part1DocId}`
-        );
+      if (!splitSource || !splitSource.trim()) {
+        throw new Error("Extraction returned empty text");
       }
-      // Always use actual word count from the text itself, not what bridge reports
-      const effectiveWordCount = actualWords;
 
-      console.log(`✓ Extraction OK | docId=${part1DocId} | words=${effectiveWordCount} (bridge reported ${wordCount})`);
-
-      // ── Step 2: Split with margin ─────────────────────────────────────────
-      // FIX 1: Pass margin so docs just over the limit stay as one part
-      const parts      = splitTextIntoParts(fullText, PART_WORD_LIMIT, PART_WORD_MARGIN);
-      const totalParts = parts.length;
+      const actualWords = splitSource.trim().split(/\s+/).length;
 
       console.log(
-        `→ Splitting | words=${effectiveWordCount} | limit=${PART_WORD_LIMIT} | ` +
-        `margin=${PART_WORD_MARGIN} | parts=${totalParts}`
+        `✓ Extraction OK | docId=${part1DocId} | ` +
+        `raw_text_words=${actualWords} | ` +
+        `optimized_words=${extractRes.data.word_count} | ` +
+        `limit=${PART_WORD_LIMIT} | margin=${PART_WORD_MARGIN}`
       );
 
-      // FIX 2: Update part1 record NOW with correct totalParts and redirect target
-      // so that the SSE/poll client immediately knows where to redirect
+      // ── Step 2: Split ─────────────────────────────────────────────────────
+      const parts      = splitTextIntoParts(splitSource, PART_WORD_LIMIT, PART_WORD_MARGIN);
+      const totalParts = parts.length;
+
+      // Log part sizes for verification
+      const partSizes = parts.map(p => p.trim().split(/\s+/).length);
+      console.log(
+        `→ Split result | raw_words=${actualWords} | parts=${totalParts} | ` +
+        `sizes=[${partSizes.join(", ")}] words`
+      );
+
+      // Update part1 with correct totalParts and redirect target
       const redirectTarget = totalParts === 1 ? "audio_player" : "dashboard";
       await Document.findOneAndUpdate(
         { docId: part1DocId, userId },
-        {
-          $set: {
-            isMultiPart:            totalParts > 1,
-            totalParts,
-            frontendRedirectTarget: redirectTarget,
-          }
-        }
+        { $set: { isMultiPart: totalParts > 1, totalParts, frontendRedirectTarget: redirectTarget } }
       );
 
       // Pre-create stubs for parts 2..N
@@ -344,45 +328,28 @@ const uploadDocument = async (req, res) => {
             { docId: pDocId, userId },
             {
               $set: {
-                userId,
-                docId:                  pDocId,
-                title:                  partTitle,
-                originalFilename:       fileOrigName,
-                format,
-                cognitiveState,
-                ttsEngine,
-                pipelineStatus:         "processing",
-                pipelineError:          null,
-                sessionsGenerated:      0,
-                isMultiPart:            true,
-                partNumber:             i + 1,
-                totalParts,
-                parentDocId:            part1DocId,
-                frontendRedirectTarget: "dashboard",
+                userId, docId: pDocId, title: partTitle,
+                originalFilename: fileOrigName, format, cognitiveState, ttsEngine,
+                pipelineStatus: "processing", pipelineError: null, sessionsGenerated: 0,
+                isMultiPart: true, partNumber: i + 1, totalParts,
+                parentDocId: part1DocId, frontendRedirectTarget: "dashboard",
               }
             },
             { upsert: true, new: true, setDefaultsOnInsert: true }
           );
-          console.log(`→ Stub created | part=${i + 1}/${totalParts} | docId=${pDocId}`);
+          console.log(`→ Stub created | part=${i + 1}/${totalParts} | docId=${pDocId} | words=${partSizes[i]}`);
         }
       }
 
-      // ── Step 3: Process part 1 first — unblocks the frontend redirect ─────
+      // ── Step 3: Process part 1 — unblocks frontend redirect ──────────────
       try {
         await processOnePart({
-          partText:        parts[0],
-          partDocId:       part1DocId,
-          partTitle:       totalParts > 1 ? `${documentTitle} — Part 1` : documentTitle,
-          cognitiveState,
-          ttsEngine,
-          voiceId,
-          userRole,
-          userId,
-          originalFilename: fileOrigName,
-          format,
-          partNumber:      1,
-          totalParts,
-          parentDocId:     null,
+          partText:         parts[0],
+          partDocId:        part1DocId,
+          partTitle:        totalParts > 1 ? `${documentTitle} — Part 1` : documentTitle,
+          cognitiveState, ttsEngine, voiceId, userRole, userId,
+          originalFilename: fileOrigName, format,
+          partNumber: 1, totalParts, parentDocId: null,
         });
       } catch (partErr) {
         console.error(`✗ Part 1 FAILED | docId=${part1DocId} |`, partErr.message);
@@ -390,32 +357,21 @@ const uploadDocument = async (req, res) => {
           { docId: part1DocId, userId },
           { $set: { pipelineStatus: "error", pipelineError: partErr.message } }
         );
-        // Don't process remaining parts if part 1 failed
         return;
       }
 
-      // ── Step 4: Parts 2..N — fire and forget after part 1 is ready ────────
-      // These run sequentially but do NOT block the SSE "done" event which
-      // already fired when part 1 hit audio_ready.
+      // ── Step 4: Parts 2..N — fire and forget ──────────────────────────────
       if (totalParts > 1) {
         for (let i = 1; i < totalParts; i++) {
           const partDocId = partDocIds[i];
-          const partTitle = `${documentTitle} — Part ${i + 1}`;
           try {
             await processOnePart({
-              partText:        parts[i],
+              partText:         parts[i],
               partDocId,
-              partTitle,
-              cognitiveState,
-              ttsEngine,
-              voiceId,
-              userRole,
-              userId,
-              originalFilename: fileOrigName,
-              format,
-              partNumber:      i + 1,
-              totalParts,
-              parentDocId:     part1DocId,
+              partTitle:        `${documentTitle} — Part ${i + 1}`,
+              cognitiveState, ttsEngine, voiceId, userRole, userId,
+              originalFilename: fileOrigName, format,
+              partNumber: i + 1, totalParts, parentDocId: part1DocId,
             });
           } catch (partErr) {
             console.error(`✗ Part ${i + 1}/${totalParts} FAILED | docId=${partDocId} |`, partErr.message);
@@ -423,18 +379,14 @@ const uploadDocument = async (req, res) => {
               { docId: partDocId, userId },
               { $set: { pipelineStatus: "error", pipelineError: partErr.message } }
             );
-            // Continue with remaining parts even if one fails
           }
         }
-        console.log(`✓ All ${totalParts} parts audio_ready | parentDocId=${part1DocId}`);
+        console.log(`✓ All ${totalParts} parts complete | parentDocId=${part1DocId}`);
       }
 
     } catch (err) {
       const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
-      console.error(
-        `✗ Background FAILED | docId=${part1DocId} | ` +
-        `${isTimeout ? "TIMEOUT" : "ERROR"} | ${err.message}`
-      );
+      console.error(`✗ Background FAILED | docId=${part1DocId} | ${isTimeout ? "TIMEOUT" : "ERROR"} | ${err.message}`);
       await Document.findOneAndUpdate(
         { docId: part1DocId, userId },
         { $set: { pipelineStatus: "error", pipelineError: err.message || "Pipeline failed" } }
@@ -447,27 +399,19 @@ const uploadDocument = async (req, res) => {
 // ── POST /api/documents/:docId/trigger-mcq ────────────────────────────────────
 const triggerMCQ = async (req, res) => {
   const { docId } = req.params;
-
   const doc = await Document.findOne({ docId, userId: req.user._id });
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
-  }
+  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
 
   const existingSessions = await Session.countDocuments({ docId, userId: req.user._id });
-  if (existingSessions >= 3) {
-    return res.json({ status: "success", data: { message: "MCQ already generated." } });
-  }
-
-  if (!doc.extractedText || doc.extractedText.split(" ").length < 50) {
+  if (existingSessions >= 3) return res.json({ status: "success", data: { message: "MCQ already generated." } });
+  if (!doc.extractedText || doc.extractedText.split(" ").length < 50)
     return res.json({ status: "success", data: { message: "Document too short for MCQ." } });
-  }
 
   res.json({ status: "success", data: { message: "MCQ generation started in background." } });
 
   setImmediate(async () => {
     try {
       console.log(`→ Background MCQ START | docId=${docId}`);
-
       const { data: mcqRes } = await bridgePost("/pipeline/mcq", {
         extracted_text: doc.extractedText,
         document_title: doc.title,
@@ -484,21 +428,13 @@ const triggerMCQ = async (req, res) => {
           { docId, userId: req.user._id, sessionNumber: n },
           {
             $set: {
-              userId:        req.user._id,
-              documentId:    doc._id,
-              docId,
-              sessionNumber: n,
-              difficulty:    difficulties[n],
-              status:        n === 1 ? "pending" : "locked",
-              startedAt:     null,
-              submittedAt:   null,
-              scorePct:      null,
-              correctCount:  0,
-              userAnswers:   {},
-              overrideUsed:  false,
-              questions:     qData?.questions || [],
-              answerKey:     aData            || null,
-              sessionState:  md.session_state || null,
+              userId: req.user._id, documentId: doc._id, docId,
+              sessionNumber: n, difficulty: difficulties[n],
+              status: n === 1 ? "pending" : "locked",
+              startedAt: null, submittedAt: null, scorePct: null,
+              correctCount: 0, userAnswers: {}, overrideUsed: false,
+              questions: qData?.questions || [], answerKey: aData || null,
+              sessionState: md.session_state || null,
             }
           },
           { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -509,14 +445,10 @@ const triggerMCQ = async (req, res) => {
         { docId },
         { $set: { sessionsGenerated: md.sessions_generated, pipelineStatus: "ready" } }
       );
-
       console.log(`✓ MCQ COMPLETE | docId=${docId} | sessions=3`);
     } catch (err) {
       console.error(`✗ MCQ FAILED | docId=${docId} |`, err.message);
-      await Document.findOneAndUpdate(
-        { docId },
-        { $set: { pipelineError: `MCQ generation failed: ${err.message}` } }
-      );
+      await Document.findOneAndUpdate({ docId }, { $set: { pipelineError: `MCQ failed: ${err.message}` } });
     }
   });
 };
@@ -530,19 +462,12 @@ const getDocuments = async (req, res) => {
   res.json({ status: "success", data: { documents: docs } });
 };
 
-
-// ── GET /api/documents/by-doc-id/:docId ──────────────────────────────────────
 const getDocumentByDocId = async (req, res) => {
-  const { docId } = req.params;
-  const doc = await Document.findOne({ docId, userId: req.user._id });
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
-  }
+  const doc = await Document.findOne({ docId: req.params.docId, userId: req.user._id });
+  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
   res.json({ status: "success", data: { document: doc } });
 };
 
-
-// ── GET /api/documents/by-doc-id/:docId/stream (SSE) ─────────────────────────
 const streamDocumentStatus = async (req, res) => {
   const { docId } = req.params;
   const userId    = req.user._id;
@@ -555,143 +480,100 @@ const streamDocumentStatus = async (req, res) => {
 
   const send = (event, data) => {
     if (res.writableEnded) return;
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     if (typeof res.flush === "function") res.flush();
   };
 
   const heartbeat   = setInterval(() => { if (!res.writableEnded) res.write(": ping\n\n"); }, 25_000);
-  const hardTimeout = setTimeout(() => {
-    send("error", { message: "Pipeline timed out. Please retry." });
-    cleanup();
-  }, SSE_TIMEOUT_MS);
+  const hardTimeout = setTimeout(() => { send("error", { message: "Pipeline timed out." }); cleanup(); }, SSE_TIMEOUT_MS);
   let pollTimer = null;
 
   const cleanup = () => {
-    clearInterval(heartbeat);
-    clearTimeout(hardTimeout);
-    clearTimeout(pollTimer);
+    clearInterval(heartbeat); clearTimeout(hardTimeout); clearTimeout(pollTimer);
     if (!res.writableEnded) res.end();
   };
-
   req.on("close", cleanup);
 
   const poll = async () => {
     try {
       const doc = await Document.findOne(
         { docId, userId },
-        "docId pipelineStatus pipelineError title audioUrl audioCloudUrl sessionsGenerated createdAt isMultiPart partNumber totalParts parentDocId frontendRedirectTarget"
+        "docId pipelineStatus pipelineError title audioUrl audioCloudUrl sessionsGenerated isMultiPart partNumber totalParts parentDocId frontendRedirectTarget"
       ).lean();
 
       if (!doc) { send("error", { message: "Document not found." }); return cleanup(); }
 
       const status = doc.pipelineStatus;
-
-      // FIX 2: Include frontendRedirectTarget in every status event
       send("status", {
-        docId:                  doc.docId,
-        status,
-        title:                  doc.title,
-        audioUrl:               doc.audioCloudUrl || doc.audioUrl || null,
-        sessionsGenerated:      doc.sessionsGenerated || 0,
-        pipelineError:          doc.pipelineError || null,
-        isMultiPart:            doc.isMultiPart || false,
-        partNumber:             doc.partNumber || 1,
-        totalParts:             doc.totalParts || 1,
+        docId: doc.docId, status, title: doc.title,
+        audioUrl: doc.audioCloudUrl || doc.audioUrl || null,
+        sessionsGenerated: doc.sessionsGenerated || 0,
+        pipelineError: doc.pipelineError || null,
+        isMultiPart: doc.isMultiPart || false,
+        partNumber: doc.partNumber || 1, totalParts: doc.totalParts || 1,
         frontendRedirectTarget: doc.frontendRedirectTarget || "audio_player",
       });
 
       if (status === "ready" || status === "audio_ready" || status === "error") {
         send("done", {
-          docId:                  doc.docId,
-          status,
+          docId: doc.docId, status,
           frontendRedirectTarget: doc.frontendRedirectTarget || "audio_player",
-          isMultiPart:            doc.isMultiPart || false,
+          isMultiPart: doc.isMultiPart || false,
         });
         return cleanup();
       }
-
       pollTimer = setTimeout(poll, SSE_POLL_INTERVAL_MS);
     } catch (err) {
-      console.error("[SSE] error:", err.message);
-      send("error", { message: "Internal error during status check." });
-      cleanup();
+      send("error", { message: "Internal error during status check." }); cleanup();
     }
   };
-
   poll();
 };
 
-
-// ── GET /api/documents/:id ────────────────────────────────────────────────────
 const getDocument = async (req, res) => {
   const doc = await Document.findOne({ _id: req.params.id, userId: req.user._id });
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
-  }
+  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
   res.json({ status: "success", data: { document: doc } });
 };
 
-
-// ── DELETE /api/documents/:id ─────────────────────────────────────────────────
 const deleteDocument = async (req, res) => {
   const doc = await Document.findOne({ _id: req.params.id, userId: req.user._id });
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
-  }
+  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
 
   const toDelete = [doc];
-
   if (doc.isMultiPart && !doc.parentDocId) {
     const siblings = await Document.find({ parentDocId: doc.docId, userId: req.user._id });
     toDelete.push(...siblings);
   }
-
   for (const d of toDelete) {
     if (d.audioPublicId && isConfigured()) {
-      try {
-        const { deleteAudio } = require("../config/cloudinary");
-        await deleteAudio(d.audioPublicId);
-      } catch (e) {
-        console.error("Cloudinary delete failed (non-fatal):", e.message);
-      }
+      try { const { deleteAudio } = require("../config/cloudinary"); await deleteAudio(d.audioPublicId); }
+      catch (e) { console.error("Cloudinary delete failed:", e.message); }
     }
     await Session.deleteMany({ documentId: d._id });
     await d.deleteOne();
   }
-
   res.json({ status: "success", data: { message: `Deleted ${toDelete.length} document(s).` } });
 };
 
-
-// ── GET /api/documents/:docId/captions ───────────────────────────────────────
 const getCaptions = async (req, res) => {
   const { docId } = req.params;
   const doc = await Document.findOne({ docId, userId: req.user._id });
   if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
   if (doc.captions?.length > 0) {
-    return res.json({
-      status: "success",
-      data: { captions: doc.captions, total: doc.captions.length, cached: true, generatedAt: doc.captionsGeneratedAt },
-    });
+    return res.json({ status: "success", data: { captions: doc.captions, total: doc.captions.length, cached: true, generatedAt: doc.captionsGeneratedAt } });
   }
-  if (!doc.extractedText || !doc.durationSec) {
+  if (!doc.extractedText || !doc.durationSec)
     return res.status(404).json({ status: "error", error: "Captions not available." });
-  }
   const { data } = await bridgePost("/captions", { text: doc.extractedText, duration_sec: doc.durationSec });
   const result   = data.data;
   await Document.findOneAndUpdate({ docId }, { captions: result.captions, captionsGeneratedAt: new Date() });
   res.json({ status: "success", data: { captions: result.captions, total: result.total_segments, cached: false } });
 };
 
-
-// ── GET /api/documents/:docId/visualization ───────────────────────────────────
 const getVisualization = async (req, res) => {
   const { docId } = req.params;
-  const doc = await Document.findOne(
-    { docId, userId: req.user._id },
-    "visualizationHtml visualizationType title"
-  );
+  const doc = await Document.findOne({ docId, userId: req.user._id }, "visualizationHtml visualizationType title");
   if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
   if (!doc.visualizationHtml) return res.status(404).json({ status: "error", error: "Visualization not available." });
   res.setHeader("Content-Type", "text/html");
@@ -700,13 +582,6 @@ const getVisualization = async (req, res) => {
 
 
 module.exports = {
-  uploadDocument,
-  triggerMCQ,
-  getDocuments,
-  getDocumentByDocId,
-  streamDocumentStatus,
-  getDocument,
-  deleteDocument,
-  getCaptions,
-  getVisualization,
+  uploadDocument, triggerMCQ, getDocuments, getDocumentByDocId,
+  streamDocumentStatus, getDocument, deleteDocument, getCaptions, getVisualization,
 };
