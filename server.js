@@ -1,19 +1,18 @@
-// Tarang 2.2.0 — server.js
+// Tarang 2.2.1 — server.js
 //
-// v2.2.0 changes:
-//   CORS: added maxAge: 86400 — browser caches the OPTIONS preflight for 24h.
-//         This eliminates the OPTIONS spam visible in the network tab.
-//         Also added explicit app.options("*") handler so preflight never
-//         reaches controllers.
-//   auth: protect middleware now accepts ?token= query param on GET requests.
-//         Required because EventSource (SSE) cannot send custom headers,
-//         so the JWT must travel as a query param for the stream endpoint.
+// v2.2.1 changes:
+//   recoverStuckDocuments() called on startup (after connectDB + initJwtSecret).
+//   This marks any docs that were stuck in "processing" from a previous
+//   crash or Render redeploy as "error" immediately, so the frontend SSE
+//   stream resolves instead of hanging for 30 minutes.
+//
+// v2.2.0 changes (retained):
+//   CORS: maxAge: 86400 — browser caches OPTIONS preflight for 24h.
+//   auth: protect middleware accepts ?token= query param for SSE endpoints.
 
 require("dotenv").config();
 require("express-async-errors");
 
-// initJwtSecret is now async (reads from MongoDB).
-// It is called inside start() below — after connectDB() — so MongoDB is ready.
 const { initJwtSecret } = require("./utils/jwtSecret");
 
 const express     = require("express");
@@ -37,6 +36,9 @@ const friendsRoutes       = require("./routes/friendsRoutes");
 const sharingRoutes       = require("./routes/sharingRoutes");
 const notificationsRoutes = require("./routes/notificationsRoutes");
 const chatRoutes          = require("./routes/chatRoutes");
+
+// Import recoverStuckDocuments — called after DB is ready
+const { recoverStuckDocuments } = require("./controllers/documentController");
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -69,10 +71,8 @@ const allowedOrigins = [
   "http://localhost:5173",
 ].filter(Boolean);
 
-// Shared CORS options — defined once, reused for both app.use and app.options
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, Postman, curl)
     if (!origin) return callback(null, true);
     if (
       allowedOrigins.includes(origin) ||
@@ -83,25 +83,13 @@ const corsOptions = {
     }
     return callback(new Error(`CORS blocked: ${origin}`));
   },
-  credentials: true,
-
-  // v2.2.0: Cache preflight (OPTIONS) for 24 hours.
-  // Browser skips OPTIONS entirely for repeat requests to the same endpoint.
-  // Eliminates ~50% of the requests visible in the network tab.
-  maxAge: 86400,
-
-  // Explicit method list makes the preflight response deterministic
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-
-  // Only list headers the frontend actually sends — keeps the allow-list tight
+  credentials:    true,
+  maxAge:         86400,
+  methods:        ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
-// v2.2.0: Handle OPTIONS preflight explicitly BEFORE any route.
-// Some proxies strip CORS headers; this ensures a clean 204 is always returned
-// for preflight requests and they never reach controllers.
 app.options("*", cors(corsOptions));
-
 app.use(cors(corsOptions));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -178,10 +166,16 @@ app.get("/api/health", async (req, res) => {
   res.json({
     status:  "ok",
     service: "Tarang Express Backend",
-    version: "2.2.0",
+    version: "2.2.1",
     bridge:  bridgeAlive ? "connected" : "unreachable",
     mongo:   "connected",
     time:    new Date().toISOString(),
+    config: {
+      extract_timeout_ms:  process.env.EXTRACT_TIMEOUT_MS  || "900000 (default)",
+      pipeline_timeout_ms: process.env.PIPELINE_TIMEOUT_MS || "1200000 (default)",
+      sse_timeout_ms:      process.env.SSE_TIMEOUT_MS      || "1800000 (default)",
+      stuck_threshold_ms:  process.env.STUCK_THRESHOLD_MS  || "2100000 (default)",
+    },
   });
 });
 
@@ -200,8 +194,12 @@ app.use(errorHandler);
 const start = async () => {
   await connectDB();
 
-  // initJwtSecret MUST run after connectDB — it needs MongoDB to read/write the secret
+  // initJwtSecret MUST run after connectDB
   await initJwtSecret();
+
+  // v2.2.1: Recover any docs stuck in "processing" from a previous crash/redeploy.
+  // Must run after connectDB so MongoDB is available.
+  await recoverStuckDocuments();
 
   const bridgeAlive = await pingBridge();
   if (!bridgeAlive) {
@@ -216,8 +214,11 @@ const start = async () => {
 
   app.listen(PORT, () => {
     console.log(`✓ Tarang backend running on http://localhost:${PORT}`);
-    console.log(`  Environment : ${process.env.NODE_ENV || "development"}`);
-    console.log(`  Health check: http://localhost:${PORT}/api/health`);
+    console.log(`  Environment      : ${process.env.NODE_ENV || "development"}`);
+    console.log(`  Health check     : http://localhost:${PORT}/api/health`);
+    console.log(`  Extract timeout  : ${process.env.EXTRACT_TIMEOUT_MS  || "900000ms (15 min, default)"}`);
+    console.log(`  Pipeline timeout : ${process.env.PIPELINE_TIMEOUT_MS || "1200000ms (20 min, default)"}`);
+    console.log(`  SSE timeout      : ${process.env.SSE_TIMEOUT_MS      || "1800000ms (30 min, default)"}`);
   });
 };
 
