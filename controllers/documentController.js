@@ -1,45 +1,30 @@
-// Tarang 2.4.4 — controllers/documentController.js
+// Tarang 2.4.3 — controllers/documentController.js
 //
-// THREE BUGS FIXED vs 2.4.3:
+// ROOT CAUSE FIX for 18-parts bug (follow-up to 2.4.2):
 //
-// BUG 1 — Parts 6, 7 stuck in "processing" forever (the screenshot bug)
+//   The bridge v2.0.1 fix was correct — raw_text IS now returned with 6893 words.
+//   But splitTextIntoParts() was STILL producing 18 tiny parts because of a bug
+//   in its sentence-boundary detection logic.
 //
-//   Root cause: processOnePart() has an inner try/catch, but some errors escape it.
-//   Specifically, if Document.findOneAndUpdate() throws (e.g. MongoDB timeout),
-//   or if require("form-data") throws, the exception propagates UP past the
-//   inner try/catch in the parts 2..N for-loop, reaches the OUTER setImmediate
-//   catch, which only updates part1DocId to "error". Parts 6 and 7 had already
-//   been pre-created as stubs (pipelineStatus: "processing") but the loop body
-//   never ran for them, so they stay "processing" indefinitely.
+//   THE BUG in the old splitTextIntoParts:
+//     lookback = last 200 words of the 3800-word chunk joined as string (~1200 chars)
+//     lastSentenceEnd = last '. ' position in that string
+//     For real text (many short sentences), lastSentenceEnd ≈ 1130 (near string end)
+//     cutAt = lookback[0..1130] ≈ 188 words of lookback
+//     cutWords = 188, so next start = current_start + 188 → ~190 words per part
+//     6893 / 190 ≈ 36 raw parts → merged to 18 final parts
 //
-//   Fix A: Wrap each processOnePart() call in its own independent try/catch
-//          that GUARANTEES the stub is updated to "error" even if the catch
-//          block itself throws (double-wrapped).
+//   THE FIX:
+//     Only look for sentence boundary within the LAST 50 words of the chunk.
+//     Only accept the boundary if it keeps ≥70% of the intended chunk size.
+//     Otherwise cut at exact word limit.
+//     Result: 6893-word doc → 2 parts of ~3800 and ~3093 words ✓
 //
-//   Fix B: If the outer setImmediate catch fires, update ALL stubs that are
-//          still in "processing" state to "error" — not just part1DocId.
-//
-// BUG 2 — 7 parts instead of 2 for a ~25k word doc
-//
-//   Root cause: The 25k-word doc came from file1_extractor's large-doc sampler
-//   which caps at MAX_TTS_WORDS=25000. At limit=3800, that's ceil(25000/3800)=7 parts.
-//   This is correct arithmetic, but 7×3800-word parts each taking ~90s = ~11 min
-//   total, which is far too long and unnecessary.
-//
-//   Fix: Raise PART_WORD_LIMIT default from 3800 → 6000 so a 25k-word doc
-//   becomes 5 parts instead of 7. Also added TARANG_PART_WORD_LIMIT env override
-//   so this is tunable without code changes. Large PDFs that hit the 25k sampler
-//   cap will always produce ceil(25000/6000)=5 parts.
-//
-//   Note: the sampler cap in file1_extractor (MAX_TTS_WORDS=25000) is separate
-//   from this. To reduce part count further, also raise TARANG_PART_WORD_LIMIT
-//   in your .env (e.g. 8000 for 4 parts, 12500 for 2 parts from a 25k doc).
-//
-// BUG 3 — Bridge busy poll wastes 8–15s between parts
-//
-//   Fix: Add a 1.5s initial grace period before the first /status poll so the
-//   bridge has time to clear its busy flag after returning the HTTP 200.
-//   Also reduced BRIDGE_BUSY_POLL_MS default from 8s → 3s for faster recovery.
+// ALSO RETAINED from 2.4.2:
+//   • raw_text from bridge v2.0.1 for splitting (not optimized text)
+//   • PART_WORD_MARGIN: docs within 100 words of limit stay single part
+//   • frontendRedirectTarget: "audio_player" vs "dashboard"
+//   • Part 1 processed first to unblock frontend redirect
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
@@ -50,24 +35,16 @@ const PIPELINE_TIMEOUT_MS     = 20 * 60 * 1000;
 const SSE_POLL_INTERVAL_MS    = parseInt(process.env.SSE_POLL_INTERVAL_MS    || "3000",  10);
 const SSE_TIMEOUT_MS          = parseInt(process.env.SSE_TIMEOUT_MS          || String(10 * 60 * 1000), 10);
 const BRIDGE_BUSY_MAX_WAIT_MS = parseInt(process.env.BRIDGE_BUSY_MAX_WAIT_MS || String(18 * 60 * 1000), 10);
-// BUG 3 FIX: reduced from 8000 → 3000ms for faster recovery between parts
-const BRIDGE_BUSY_POLL_MS     = parseInt(process.env.BRIDGE_BUSY_POLL_MS     || "3000", 10);
+const BRIDGE_BUSY_POLL_MS     = parseInt(process.env.BRIDGE_BUSY_POLL_MS     || "8000", 10);
 
-// BUG 2 FIX: raised default from 3800 → 6000 so a 25k-word doc = 5 parts not 7
-const PART_WORD_LIMIT  = parseInt(process.env.TARANG_PART_WORD_LIMIT  || "6000", 10);
-const PART_WORD_MARGIN = parseInt(process.env.TARANG_PART_WORD_MARGIN || "200",  10);
+const PART_WORD_LIMIT  = parseInt(process.env.TARANG_PART_WORD_LIMIT  || "3800", 10);
+const PART_WORD_MARGIN = parseInt(process.env.TARANG_PART_WORD_MARGIN || "100",  10);
 
 
 // ── Bridge busy check ─────────────────────────────────────────────────────────
-// BUG 3 FIX: 1.5s grace period before first poll — bridge needs a moment to
-// clear its busy flag after returning HTTP 200 from /pipeline/audio.
 const waitForBridgeFree = async (docId) => {
   const start = Date.now();
   let attempt = 0;
-
-  // Grace period: give the bridge 1.5s to clear busy flag before first poll
-  await new Promise(r => setTimeout(r, 1500));
-
   while (Date.now() - start < BRIDGE_BUSY_MAX_WAIT_MS) {
     attempt++;
     try {
@@ -90,10 +67,15 @@ const waitForBridgeFree = async (docId) => {
 
 // ── Text splitter ─────────────────────────────────────────────────────────────
 // Splits raw continuous text into parts of ~wordLimit words each.
-// MUST receive raw_text (sanitize_text output) — NOT optimize_for_presentation output.
-// The optimized text has ~200-word paragraphs that cause the function to make tiny parts.
+// Docs within (limit + margin) words stay as a single part.
 //
-// v2.4.3: lookback window reduced from 200 → 50 words, with 70% size guard.
+// MUST receive raw_text (sanitize_text output) — NOT the TTS-optimized text
+// (optimize_for_presentation output). The optimized text has ~200-word paragraphs
+// that cause this function to produce hundreds of tiny parts.
+//
+// v2.4.3 FIX: lookback window reduced from 200 → 50 words, with 70% size guard.
+// The old 200-word window always found a sentence boundary within 13 words of
+// the end of any real chunk, cutting at ~190 words instead of ~3800.
 const splitTextIntoParts = (text, wordLimit, margin = 0) => {
   const words = text.trim().split(/\s+/);
 
@@ -112,6 +94,8 @@ const splitTextIntoParts = (text, wordLimit, margin = 0) => {
     }
 
     // Look for a clean sentence boundary within the LAST 50 words only.
+    // (Old code used 200 words, which always found a boundary ~13 words
+    //  before end of chunk → ~190-word parts instead of ~3800-word parts.)
     const lookbackStart = Math.max(start, end - 50);
     const lookback      = words.slice(lookbackStart, end).join(" ");
 
@@ -126,7 +110,9 @@ const splitTextIntoParts = (text, wordLimit, margin = 0) => {
       const cutWords  = cutAt.trim().split(/\s+/).length;
       const actualCut = (lookbackStart - start) + cutWords;
 
-      // Only accept if ≥70% of intended chunk size to prevent early cuts
+      // Only accept this boundary if it keeps ≥70% of the intended chunk.
+      // Prevents pathological early cuts when the last sentence happens to be
+      // very short and far from wordLimit.
       if (actualCut >= wordLimit * 0.7) {
         parts.push(words.slice(start, start + actualCut).join(" ").trim());
         start += actualCut;
@@ -134,7 +120,7 @@ const splitTextIntoParts = (text, wordLimit, margin = 0) => {
       }
     }
 
-    // No usable sentence boundary — cut at exact word limit
+    // No usable sentence boundary found — cut at exact word limit
     parts.push(words.slice(start, end).join(" ").trim());
     start = end;
   }
@@ -150,22 +136,6 @@ const makeDocId = (seed) => {
 };
 
 
-// ── Safe stub error updater ───────────────────────────────────────────────────
-// BUG 1 FIX: Updates a stub to "error" state. Double-wrapped so it never throws
-// even if MongoDB is unavailable. Used in both the part loop and the outer catch.
-const safeMarkError = async (docId, userId, message) => {
-  try {
-    await Document.findOneAndUpdate(
-      { docId, userId },
-      { $set: { pipelineStatus: "error", pipelineError: message } }
-    );
-  } catch (dbErr) {
-    // MongoDB itself failed — just log, never throw from error handlers
-    console.error(`✗ safeMarkError DB write failed | docId=${docId} |`, dbErr.message);
-  }
-};
-
-
 // ── Process one part through pipeline/audio → Cloudinary → DB ────────────────
 const processOnePart = async ({
   partText, partDocId, partTitle, cognitiveState, ttsEngine, voiceId,
@@ -174,8 +144,8 @@ const processOnePart = async ({
   const free = await waitForBridgeFree(partDocId);
   if (!free) throw new Error("Bridge was busy for too long.");
 
-  const FormData = require("form-data");
-  const form     = new FormData();
+  const FormData  = require("form-data");
+  const form      = new FormData();
   const partWords = partText.trim().split(/\s+/).length;
 
   const partBuffer = Buffer.from(partText, "utf-8");
@@ -304,10 +274,6 @@ const uploadDocument = async (req, res) => {
   const userRole     = req.user.role;
   const format       = req.file.originalname.split(".").pop().toLowerCase();
 
-  // Track all stub docIds created so we can clean them up on total failure
-  // BUG 1 FIX: needed for the outer catch to mark ALL stubs as error
-  const allPartDocIds = [part1DocId];
-
   setImmediate(async () => {
     try {
       console.log(`→ Background START | docId=${part1DocId}`);
@@ -333,13 +299,17 @@ const uploadDocument = async (req, res) => {
         throw new Error(extractRes.error || "Extraction failed");
       }
 
-      // Use raw_text for splitting — continuous string, not paragraph-split prose
+      // ── Use raw_text for splitting ─────────────────────────────────────────
+      // raw_text = sanitize_text() output — continuous string for correct splitting.
+      // data.text = optimize_for_presentation() output — paragraph-split prose
+      //             (~200 words/para × 36 paras = 36 sections → 18 bad parts).
+      // bridge v2.0.1 returns both fields. The || fallback should never trigger.
       const splitSource = extractRes.data.raw_text || extractRes.data.text;
 
       if (!extractRes.data.raw_text) {
         console.error(
-          `✗ CRITICAL: Bridge did not return raw_text | docId=${part1DocId}. ` +
-          `Update bridge.py to v2.0.1 — splitting will be incorrect without raw_text.`
+          `✗ CRITICAL: Bridge did not return raw_text for docId=${part1DocId}. ` +
+          `Please update bridge.py to v2.0.1 — splitting will be incorrect.`
         );
       }
 
@@ -373,12 +343,12 @@ const uploadDocument = async (req, res) => {
       );
 
       // Pre-create stubs for parts 2..N
-      // BUG 1 FIX: track ALL docIds so the outer catch can mark them all as error
+      const partDocIds = [part1DocId];
       if (totalParts > 1) {
         for (let i = 1; i < totalParts; i++) {
           const pDocId    = makeDocId(`${part1DocId}_part${i + 1}`);
           const partTitle = `${documentTitle} — Part ${i + 1}`;
-          allPartDocIds.push(pDocId);                             // ← track it
+          partDocIds.push(pDocId);
           await Document.findOneAndUpdate(
             { docId: pDocId, userId },
             {
@@ -408,26 +378,17 @@ const uploadDocument = async (req, res) => {
         });
       } catch (partErr) {
         console.error(`✗ Part 1 FAILED | docId=${part1DocId} |`, partErr.message);
-        // BUG 1 FIX: use safeMarkError so this never throws
-        await safeMarkError(part1DocId, userId, partErr.message);
-        // Mark all remaining stubs as error too — they'll never be processed
-        for (let i = 1; i < totalParts; i++) {
-          await safeMarkError(allPartDocIds[i], userId, "Skipped — Part 1 failed");
-        }
+        await Document.findOneAndUpdate(
+          { docId: part1DocId, userId },
+          { $set: { pipelineStatus: "error", pipelineError: partErr.message } }
+        );
         return;
       }
 
       // ── Step 4: Parts 2..N ────────────────────────────────────────────────
-      // BUG 1 FIX: each part gets its own isolated try/catch that is guaranteed
-      // to update the stub to "error" even if MongoDB or the DB write fails.
-      // Previously, an unhandled exception in processOnePart could propagate up
-      // past this loop to the outer setImmediate catch, leaving subsequent stubs
-      // stuck in "processing" forever.
       if (totalParts > 1) {
         for (let i = 1; i < totalParts; i++) {
-          const partDocId = allPartDocIds[i];
-          let partSucceeded = false;
-
+          const partDocId = partDocIds[i];
           try {
             await processOnePart({
               partText:         parts[i],
@@ -437,37 +398,24 @@ const uploadDocument = async (req, res) => {
               originalFilename: fileOrigName, format,
               partNumber: i + 1, totalParts, parentDocId: part1DocId,
             });
-            partSucceeded = true;
           } catch (partErr) {
             console.error(`✗ Part ${i + 1}/${totalParts} FAILED | docId=${partDocId} |`, partErr.message);
-            // BUG 1 FIX: safeMarkError never throws — the loop always continues
-            await safeMarkError(partDocId, userId, partErr.message);
-          }
-
-          // Continue to next part regardless of success/failure
-          if (!partSucceeded) {
-            console.log(`→ Continuing to next part despite Part ${i + 1} failure`);
+            await Document.findOneAndUpdate(
+              { docId: partDocId, userId },
+              { $set: { pipelineStatus: "error", pipelineError: partErr.message } }
+            );
           }
         }
-        console.log(`✓ Parts loop complete | totalParts=${totalParts} | parentDocId=${part1DocId}`);
+        console.log(`✓ All ${totalParts} parts complete | parentDocId=${part1DocId}`);
       }
 
     } catch (err) {
-      // BUG 1 FIX: outer catch now marks ALL stubs as error, not just part1DocId.
-      // Previously this only updated part1DocId, leaving stubs for parts 2..N
-      // stuck in "processing" state indefinitely.
       const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
-      const errMsg    = err.message || "Pipeline failed";
-      console.error(`✗ Background FAILED | docId=${part1DocId} | ${isTimeout ? "TIMEOUT" : "ERROR"} | ${errMsg}`);
-
-      // Mark ALL pre-created stubs as error, not just part 1
-      for (const docId of allPartDocIds) {
-        await safeMarkError(
-          docId,
-          userId,
-          docId === part1DocId ? errMsg : `Background pipeline failed before this part was reached`
-        );
-      }
+      console.error(`✗ Background FAILED | docId=${part1DocId} | ${isTimeout ? "TIMEOUT" : "ERROR"} | ${err.message}`);
+      await Document.findOneAndUpdate(
+        { docId: part1DocId, userId },
+        { $set: { pipelineStatus: "error", pipelineError: err.message || "Pipeline failed" } }
+      );
     }
   });
 };
@@ -525,7 +473,7 @@ const triggerMCQ = async (req, res) => {
       console.log(`✓ MCQ COMPLETE | docId=${docId} | sessions=3`);
     } catch (err) {
       console.error(`✗ MCQ FAILED | docId=${docId} |`, err.message);
-      await safeMarkError(docId, null, `MCQ failed: ${err.message}`);
+      await Document.findOneAndUpdate({ docId }, { $set: { pipelineError: `MCQ failed: ${err.message}` } });
     }
   });
 };
