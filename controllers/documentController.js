@@ -1,34 +1,30 @@
-// Tarang 2.4.2 — controllers/documentController.js
+// Tarang 2.4.3 — controllers/documentController.js
 //
-// ROOT CAUSE FIX for 19-parts bug:
+// ROOT CAUSE FIX for 18-parts bug (follow-up to 2.4.2):
 //
-//   The bridge /extract endpoint returns TWO text fields:
-//     • data.text     = optimize_for_presentation(clean_text)
-//                       PARAGRAPH-SPLIT prose. Each section ~200 words separated
-//                       by \n\n. A 7200-word PDF becomes ~36 paragraphs.
-//                       splitTextIntoParts() saw 36 chunks → made 19 "parts". ← BUG
+//   The bridge v2.0.1 fix was correct — raw_text IS now returned with 6893 words.
+//   But splitTextIntoParts() was STILL producing 18 tiny parts because of a bug
+//   in its sentence-boundary detection logic.
 //
-//     • data.raw_text = sanitize_text(clean_text)
-//                       FULL DOCUMENT as one continuous string.
-//                       7200 words → correctly splits into 2 parts. ← FIX
+//   THE BUG in the old splitTextIntoParts:
+//     lookback = last 200 words of the 3800-word chunk joined as string (~1200 chars)
+//     lastSentenceEnd = last '. ' position in that string
+//     For real text (many short sentences), lastSentenceEnd ≈ 1130 (near string end)
+//     cutAt = lookback[0..1130] ≈ 188 words of lookback
+//     cutWords = 188, so next start = current_start + 188 → ~190 words per part
+//     6893 / 190 ≈ 36 raw parts → merged to 18 final parts
 //
-//   The bug was in bridge.py — the /extract endpoint was NOT returning raw_text
-//   at all. This controller already had the correct fallback logic:
-//     const splitSource = extractRes.data.raw_text || extractRes.data.text;
-//   But since raw_text was undefined, it always fell back to data.text (bug path).
+//   THE FIX:
+//     Only look for sentence boundary within the LAST 50 words of the chunk.
+//     Only accept the boundary if it keeps ≥70% of the intended chunk size.
+//     Otherwise cut at exact word limit.
+//     Result: 6893-word doc → 2 parts of ~3800 and ~3093 words ✓
 //
-//   Fix: bridge.py v2.0.1 now exposes raw_text in the /extract response.
-//   This controller reads it correctly. A defensive guard is added below
-//   to log a clear error if raw_text is ever missing again in future.
-//
-//   Word count displayed on dashboard now comes from raw_text word count,
-//   not from the bridge's reported word_count (which counted optimized prose).
-//
-// OTHER FIXES retained from 2.4.1:
-//   • PART_WORD_MARGIN: docs within 100 words of limit stay as single part
+// ALSO RETAINED from 2.4.2:
+//   • raw_text from bridge v2.0.1 for splitting (not optimized text)
+//   • PART_WORD_MARGIN: docs within 100 words of limit stay single part
 //   • frontendRedirectTarget: "audio_player" vs "dashboard"
 //   • Part 1 processed first to unblock frontend redirect
-//   • Parts 2..N fire-and-forget after part 1 is audio_ready
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
@@ -70,14 +66,16 @@ const waitForBridgeFree = async (docId) => {
 
 
 // ── Text splitter ─────────────────────────────────────────────────────────────
-// Splits raw continuous text at sentence boundaries.
+// Splits raw continuous text into parts of ~wordLimit words each.
 // Docs within (limit + margin) words stay as a single part.
 //
-// IMPORTANT: This function must receive raw_text (sanitize_text() output),
-// NOT the optimized text (optimize_for_presentation() output).
-// The optimized text is paragraph-split by \n\n into ~200-word chunks,
-// which causes this function to see 36 "words groups" instead of the
-// full continuous 7200-word document — resulting in 19 parts instead of 2.
+// MUST receive raw_text (sanitize_text output) — NOT the TTS-optimized text
+// (optimize_for_presentation output). The optimized text has ~200-word paragraphs
+// that cause this function to produce hundreds of tiny parts.
+//
+// v2.4.3 FIX: lookback window reduced from 200 → 50 words, with 70% size guard.
+// The old 200-word window always found a sentence boundary within 13 words of
+// the end of any real chunk, cutting at ~190 words instead of ~3800.
 const splitTextIntoParts = (text, wordLimit, margin = 0) => {
   const words = text.trim().split(/\s+/);
 
@@ -87,27 +85,43 @@ const splitTextIntoParts = (text, wordLimit, margin = 0) => {
   let start = 0;
 
   while (start < words.length) {
-    const end   = Math.min(start + wordLimit, words.length);
-    let   slice = words.slice(start, end).join(" ");
+    const end = Math.min(start + wordLimit, words.length);
 
-    if (end < words.length) {
-      const lookback        = words.slice(Math.max(start, end - 200), end).join(" ");
-      const lastSentenceEnd = Math.max(
-        lookback.lastIndexOf(". "),
-        lookback.lastIndexOf("! "),
-        lookback.lastIndexOf("? "),
-      );
-      if (lastSentenceEnd > lookback.length * 0.6) {
-        const cutAt    = lookback.substring(0, lastSentenceEnd + 1);
-        const cutWords = cutAt.trim().split(/\s+/).length;
-        slice          = words.slice(start, start + cutWords).join(" ");
-        parts.push(slice.trim());
-        start += cutWords;
+    // Last chunk — take everything remaining
+    if (end >= words.length) {
+      parts.push(words.slice(start).join(" ").trim());
+      break;
+    }
+
+    // Look for a clean sentence boundary within the LAST 50 words only.
+    // (Old code used 200 words, which always found a boundary ~13 words
+    //  before end of chunk → ~190-word parts instead of ~3800-word parts.)
+    const lookbackStart = Math.max(start, end - 50);
+    const lookback      = words.slice(lookbackStart, end).join(" ");
+
+    const lastSentenceEnd = Math.max(
+      lookback.lastIndexOf(". "),
+      lookback.lastIndexOf("! "),
+      lookback.lastIndexOf("? "),
+    );
+
+    if (lastSentenceEnd !== -1) {
+      const cutAt     = lookback.substring(0, lastSentenceEnd + 1);
+      const cutWords  = cutAt.trim().split(/\s+/).length;
+      const actualCut = (lookbackStart - start) + cutWords;
+
+      // Only accept this boundary if it keeps ≥70% of the intended chunk.
+      // Prevents pathological early cuts when the last sentence happens to be
+      // very short and far from wordLimit.
+      if (actualCut >= wordLimit * 0.7) {
+        parts.push(words.slice(start, start + actualCut).join(" ").trim());
+        start += actualCut;
         continue;
       }
     }
 
-    parts.push(slice.trim());
+    // No usable sentence boundary found — cut at exact word limit
+    parts.push(words.slice(start, end).join(" ").trim());
     start = end;
   }
 
@@ -130,12 +144,10 @@ const processOnePart = async ({
   const free = await waitForBridgeFree(partDocId);
   if (!free) throw new Error("Bridge was busy for too long.");
 
-  const FormData = require("form-data");
-  const form     = new FormData();
+  const FormData  = require("form-data");
+  const form      = new FormData();
   const partWords = partText.trim().split(/\s+/).length;
 
-  // Send the raw part text as a .txt file so bridge's pipeline/audio
-  // can run TTS optimization on it internally
   const partBuffer = Buffer.from(partText, "utf-8");
   form.append("file", partBuffer, { filename: `${partDocId}.txt`, contentType: "text/plain" });
   form.append("cognitive_state", cognitiveState);
@@ -287,29 +299,17 @@ const uploadDocument = async (req, res) => {
         throw new Error(extractRes.error || "Extraction failed");
       }
 
-      // ── ROOT CAUSE FIX ────────────────────────────────────────────────────
-      // WRONG (caused 19-parts bug):  extractRes.data.text
-      //   → optimize_for_presentation() output
-      //   → paragraph-split into ~200-word chunks separated by \n\n
-      //   → splitTextIntoParts() splits EACH PARAGRAPH as if it were a document
-      //   → 7200-word PDF → 36 paragraphs → 19 "parts" of ~180-200 words each
-      //
-      // CORRECT (fixed):              extractRes.data.raw_text
-      //   → sanitize_text() output — one continuous string, no \n\n splitting
-      //   → splitTextIntoParts() sees the full 7200-word document
-      //   → 7200 words → correctly split into 2 parts of ~3600 words each
-      //
-      // bridge.py v2.0.1 now exposes raw_text in the /extract response.
-      // The || fallback to data.text is kept for safety but should never trigger.
-      //
+      // ── Use raw_text for splitting ─────────────────────────────────────────
+      // raw_text = sanitize_text() output — continuous string for correct splitting.
+      // data.text = optimize_for_presentation() output — paragraph-split prose
+      //             (~200 words/para × 36 paras = 36 sections → 18 bad parts).
+      // bridge v2.0.1 returns both fields. The || fallback should never trigger.
       const splitSource = extractRes.data.raw_text || extractRes.data.text;
 
-      // Defensive guard: warn clearly if raw_text is missing (bridge not updated)
       if (!extractRes.data.raw_text) {
         console.error(
           `✗ CRITICAL: Bridge did not return raw_text for docId=${part1DocId}. ` +
-          `Falling back to data.text — this WILL cause incorrect part splitting! ` +
-          `Please update bridge.py to v2.0.1.`
+          `Please update bridge.py to v2.0.1 — splitting will be incorrect.`
         );
       }
 
@@ -330,14 +330,12 @@ const uploadDocument = async (req, res) => {
       const parts      = splitTextIntoParts(splitSource, PART_WORD_LIMIT, PART_WORD_MARGIN);
       const totalParts = parts.length;
 
-      // Log part sizes for verification
       const partSizes = parts.map(p => p.trim().split(/\s+/).length);
       console.log(
         `→ Split result | raw_words=${actualWords} | parts=${totalParts} | ` +
         `sizes=[${partSizes.join(", ")}] words`
       );
 
-      // Update part1 with correct totalParts and redirect target
       const redirectTarget = totalParts === 1 ? "audio_player" : "dashboard";
       await Document.findOneAndUpdate(
         { docId: part1DocId, userId },
@@ -368,7 +366,7 @@ const uploadDocument = async (req, res) => {
         }
       }
 
-      // ── Step 3: Process part 1 — unblocks frontend redirect ──────────────
+      // ── Step 3: Process part 1 first — unblocks frontend redirect ─────────
       try {
         await processOnePart({
           partText:         parts[0],
@@ -387,7 +385,7 @@ const uploadDocument = async (req, res) => {
         return;
       }
 
-      // ── Step 4: Parts 2..N — processed sequentially after part 1 ─────────
+      // ── Step 4: Parts 2..N ────────────────────────────────────────────────
       if (totalParts > 1) {
         for (let i = 1; i < totalParts; i++) {
           const partDocId = partDocIds[i];
