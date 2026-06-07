@@ -167,6 +167,30 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
+
+app.get("/smtp-test", async (req, res) => {
+  const dns = require("dns").promises;
+
+  try {
+    const result = await dns.lookup("smtp.gmail.com");
+
+    res.json({
+      success: true,
+      result,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+
+
+
+
+
 app.use((req, res) => {
   res.status(404).json({
     status: "error",
