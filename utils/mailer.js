@@ -1,28 +1,26 @@
-// Tarang 2.3.2 — utils/mailer.js
+// Tarang 2.3.3 — utils/mailer.js
 // Place at: backend/utils/mailer.js
 //
-// v2.3.2 change: switched transport from Resend → Brevo (formerly Sendinblue).
-//   Brevo allows sending from a plain Gmail address without owning a domain —
-//   it verifies sender identity via a confirmation email to that address,
-//   not via DNS records. Free tier: 300 emails/day, 9000/month.
+// v2.3.3 fix: @getbrevo/brevo was fully rewritten — SibApiV3Sdk style is gone.
+//   Now uses the new BrevoClient API that works on Node 22+.
 //
 //   Setup (one-time):
 //     1. npm install @getbrevo/brevo
-//     2. Sign up at https://app.brevo.com
-//     3. Go to Senders & IPs → Senders → Add a Sender
-//        → enter "Tarang" + tarang.termoid@gmail.com → confirm the email Brevo sends you
-//     4. Go to SMTP & API → API Keys → Generate a new API key
+//     2. Sign up at https://app.brevo.com (free: 300 emails/day)
+//     3. Senders & IPs → Senders → Add a Sender
+//        → "Tarang" + tarang.termoid@gmail.com → confirm the email Brevo sends you
+//     4. SMTP & API → API Keys → Generate → copy it
 //     5. Add BREVO_API_KEY to your Render environment variables
 //
 //   All function signatures and HTML templates are identical to v2.3.0.
 
-const SibApiV3Sdk = require("@getbrevo/brevo");
+const { BrevoClient, BrevoEnvironment } = require("@getbrevo/brevo");
 
 // ── Brevo client setup ────────────────────────────────────────────────────────
-const apiClient = SibApiV3Sdk.ApiClient.instance;
-apiClient.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
-
-const transactionalApi = new SibApiV3Sdk.TransactionalEmailsApi();
+const brevo = new BrevoClient({
+  environment: BrevoEnvironment.Production,
+  apiKey:      process.env.BREVO_API_KEY,
+});
 
 const SENDER = {
   name:  "Tarang",
@@ -82,7 +80,7 @@ const _otpBlock = (otp) => `
 // ── Internal send helper ──────────────────────────────────────────────────────
 const _send = async ({ to, subject, html }) => {
   try {
-    const result = await transactionalApi.sendTransacEmail({
+    const result = await brevo.transactionalEmails.sendTransacEmail({
       sender:      SENDER,
       to:          [{ email: to }],
       subject,
@@ -90,8 +88,7 @@ const _send = async ({ to, subject, html }) => {
     });
     return result;
   } catch (err) {
-    // Brevo wraps errors in err.response.text — surface it clearly
-    const detail = err?.response?.text || err?.message || String(err);
+    const detail = err?.body?.message || err?.message || String(err);
     console.error("❌ Brevo mailer error:", detail);
     throw new Error(`Mailer failed: ${detail}`);
   }
