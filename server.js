@@ -167,62 +167,6 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
-
-app.get("/smtp-test", async (req, res) => {
-  const dns = require("dns").promises;
-
-  try {
-    const result = await dns.lookup("smtp.gmail.com");
-
-    res.json({
-      success: true,
-      result,
-    });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message,
-    });
-  }
-});
-
-
-const net = require("net");
-
-app.get("/smtp-port-test", (req, res) => {
-  const socket = net.createConnection(587, "smtp.gmail.com");
-
-  socket.setTimeout(10000);
-
-  socket.on("connect", () => {
-    socket.destroy();
-    res.json({
-      success: true,
-      message: "Connected to Gmail SMTP"
-    });
-  });
-
-  socket.on("timeout", () => {
-    socket.destroy();
-    res.status(500).json({
-      success: false,
-      error: "Connection timeout"
-    });
-  });
-
-  socket.on("error", (err) => {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  });
-});
-
-
-
-
-
-
 app.use((req, res) => {
   res.status(404).json({
     status: "error",
