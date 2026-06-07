@@ -1,40 +1,37 @@
-// Tarang 2.3.0 — utils/mailer.js
+// Tarang 2.3.2 — utils/mailer.js
 // Place at: backend/utils/mailer.js
 //
-// v2.3.0 additions:
-//   Three separate email templates:
-//     sendOtpEmail()        — forgot-password OTP (was the only one in v2.2.0)
-//     sendSignupOtpEmail()  — email verification OTP sent after registration
-//     sendLoginOtpEmail()   — login OTP sent after credentials pass
-//     sendAudioReadyEmail() — notifies user when their document audio is ready
+// v2.3.2 change: switched transport from Resend → Brevo (formerly Sendinblue).
+//   Brevo allows sending from a plain Gmail address without owning a domain —
+//   it verifies sender identity via a confirmation email to that address,
+//   not via DNS records. Free tier: 300 emails/day, 9000/month.
+//
+//   Setup (one-time):
+//     1. npm install @getbrevo/brevo
+//     2. Sign up at https://app.brevo.com
+//     3. Go to Senders & IPs → Senders → Add a Sender
+//        → enter "Tarang" + tarang.termoid@gmail.com → confirm the email Brevo sends you
+//     4. Go to SMTP & API → API Keys → Generate a new API key
+//     5. Add BREVO_API_KEY to your Render environment variables
+//
+//   All function signatures and HTML templates are identical to v2.3.0.
 
-const nodemailer = require("nodemailer");
+const SibApiV3Sdk = require("@getbrevo/brevo");
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  },
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
-  socketTimeout: 20000,
-});
+// ── Brevo client setup ────────────────────────────────────────────────────────
+const apiClient = SibApiV3Sdk.ApiClient.instance;
+apiClient.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
 
-// Verify SMTP on startup
-transporter.verify((error, success) => {
-  if (error) {
-    console.error("❌ SMTP VERIFY FAILED");
-    console.error(error);
-  } else {
-    console.log("✅ SMTP READY");
-  }
-});
+const transactionalApi = new SibApiV3Sdk.TransactionalEmailsApi();
+
+const SENDER = {
+  name:  "Tarang",
+  email: process.env.MAIL_USER || "tarang.termoid@gmail.com",
+};
+
+console.log(`✅ Mailer ready (Brevo HTTP) — sending as ${SENDER.name} <${SENDER.email}>`);
 
 // ── Shared HTML shell ─────────────────────────────────────────────────────────
-// All emails share the same dark card wrapper so they look consistent.
 const _shell = (accentColor, body) => `
 <!DOCTYPE html>
 <html>
@@ -82,6 +79,24 @@ const _otpBlock = (otp) => `
   </div>
 `;
 
+// ── Internal send helper ──────────────────────────────────────────────────────
+const _send = async ({ to, subject, html }) => {
+  try {
+    const result = await transactionalApi.sendTransacEmail({
+      sender:      SENDER,
+      to:          [{ email: to }],
+      subject,
+      htmlContent: html,
+    });
+    return result;
+  } catch (err) {
+    // Brevo wraps errors in err.response.text — surface it clearly
+    const detail = err?.response?.text || err?.message || String(err);
+    console.error("❌ Brevo mailer error:", detail);
+    throw new Error(`Mailer failed: ${detail}`);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. FORGOT PASSWORD — password reset OTP
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,8 +114,7 @@ const sendOtpEmail = async (to, otp) => {
       just ignore this email.
     </p>
   `;
-  await transporter.sendMail({
-    from:    `"Tarang" <${process.env.MAIL_USER}>`,
+  return _send({
     to,
     subject: "Tarang — Your Password Reset OTP",
     html:    _shell("#818cf8", body),
@@ -125,8 +139,7 @@ const sendSignupOtpEmail = async (to, otp, name = "there") => {
       first document and start your neuro-acoustic learning journey.
     </p>
   `;
-  await transporter.sendMail({
-    from:    `"Tarang" <${process.env.MAIL_USER}>`,
+  return _send({
     to,
     subject: "Tarang — Verify your email to get started",
     html:    _shell("#34d399", body),
@@ -152,8 +165,7 @@ const sendLoginOtpEmail = async (to, otp, name = "there") => {
       "Forgot Password" on the sign-in page.
     </p>
   `;
-  await transporter.sendMail({
-    from:    `"Tarang" <${process.env.MAIL_USER}>`,
+  return _send({
     to,
     subject: "Tarang — Your sign-in OTP",
     html:    _shell("#38bdf8", body),
@@ -193,8 +205,7 @@ const sendAudioReadyEmail = async (to, name = "there", docTitle = "Your document
       Head to your dashboard to track progress and view analytics.
     </p>
   `;
-  await transporter.sendMail({
-    from:    `"Tarang" <${process.env.MAIL_USER}>`,
+  return _send({
     to,
     subject: `Tarang — "${docTitle}" is ready to listen`,
     html:    _shell("#fb923c", body),
