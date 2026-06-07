@@ -1,11 +1,18 @@
-// Tarang 2.2.0 — controllers/analyticsController.js
+// Tarang 2.2.1 — controllers/analyticsController.js
 // STATELESS: Reads session data from MongoDB, passes to bridge as dicts.
 // Bridge returns analytics + html_content string.
 // Express stores both in MongoDB Analytics collection.
 //
-// v2.2.0: uses bridgePost() (retry on 502/503) instead of bridge.post()
-// FIX: removed stale poor_score_warning propagation from buildSessionStateFromSessions
-//      so bridge always computes relistening_recommended fresh from actual submission scores.
+// v2.2.1 fix:
+//   buildSessionDicts: added null guard on s.sessionNumber.
+//   If a session record somehow has a null/undefined sessionNumber
+//   (e.g. from a failed upsert during a race), the loop now skips it
+//   instead of writing undefined keys ("undefined": ...) into the dict,
+//   which would cause the bridge to reject the payload with a key error.
+//
+// v2.2.0 (retained):
+//   uses bridgePost() (retry on 502/503)
+//   removed stale poor_score_warning propagation from buildSessionStateFromSessions
 
 const Analytics = require("../models/Analytics");
 const Document  = require("../models/Document");
@@ -23,6 +30,11 @@ const buildSessionDicts = async (docId, userId) => {
 
   for (const s of sessions) {
     const n = s.sessionNumber;
+    // FIX: guard against null/undefined sessionNumber from failed upserts
+    if (n == null) {
+      console.warn(`[buildSessionDicts] Session with null sessionNumber found | docId=${docId} | _id=${s._id} — skipping`);
+      continue;
+    }
     all_questions[n]   = { questions: s.questions || [] };
     all_answer_keys[n] = s.answerKey || { answers: {} };
     if (s.sessionState) session_state = s.sessionState;
@@ -45,9 +57,6 @@ const buildSessionStateFromSessions = (sessions, doc) => {
     sessions:                {},
     all_sessions_complete:   doc.allSessionsComplete || false,
     answers_unlocked:        doc.allSessionsComplete || false,
-    // FIX: do NOT pre-populate poor_score_warning / relistening_recommended from
-    //      historical sessions. The bridge must compute these fresh from the live
-    //      submission so a good score (e.g. 70%) is never incorrectly flagged.
     poor_score_warning:      false,
     relistening_recommended: false,
     sessions_meta:           {},
@@ -55,8 +64,11 @@ const buildSessionStateFromSessions = (sessions, doc) => {
   };
 
   for (const s of sessions) {
-    const n = s.sessionNumber.toString();
-    state.sessions[n] = {
+    const n = s.sessionNumber;
+    // FIX: guard null sessionNumber
+    if (n == null) continue;
+    const key = n.toString();
+    state.sessions[key] = {
       status:        s.status,
       started_at:    s.startedAt?.toISOString()   || null,
       submitted_at:  s.submittedAt?.toISOString() || null,
@@ -64,14 +76,6 @@ const buildSessionStateFromSessions = (sessions, doc) => {
       override_used: s.overrideUsed || false,
       user_answers:  s.userAnswers  || {},
     };
-    // FIX REMOVED: the old block below was poisoning session_state for every
-    //              subsequent submission, causing the bridge to echo
-    //              relistening_recommended: true even when the new score was fine.
-    //
-    // if (s.scorePct !== null && s.scorePct < 0.30) {
-    //   state.poor_score_warning      = true;
-    //   state.relistening_recommended = true;
-    // }
   }
 
   return state;
@@ -88,7 +92,6 @@ const getAnalytics = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // Try MongoDB cache first
   const cached     = await Analytics.findOne({ docId, userId: req.user._id });
   const cacheValid = cached?.averageScorePct != null && cached?.averageScorePct > 0 && cached?.learningCurve != null;
 
@@ -124,7 +127,6 @@ const getAnalytics = async (req, res) => {
     return res.json({ status: "success", data: { analytics: analyticsData } });
   }
 
-  // Generate from bridge
   const { all_questions, all_answer_keys, session_state: storedState } =
     await buildSessionDicts(docId, req.user._id);
 

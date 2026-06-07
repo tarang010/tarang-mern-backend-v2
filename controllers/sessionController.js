@@ -86,10 +86,6 @@ const getSessionState = async (docId, userId) => {
       override_used: s.overrideUsed || false,
       user_answers:  s.userAnswers  || {},
     };
-    if (s.scorePct !== null && s.scorePct < 0.30) {
-      state.poor_score_warning      = true;
-      state.relistening_recommended = true;
-    }
   }
 
   return state;

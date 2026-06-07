@@ -1,4 +1,10 @@
-// Tarang 2.0.0 — models/User.js
+// Tarang 2.3.0 — models/User.js
+// Place at: backend/models/User.js
+//
+// v2.3.0 addition:
+//   isEmailVerified  — false until the signup OTP is confirmed.
+//   emailVerifiedAt  — timestamp of verification.
+//   login() in authController checks isEmailVerified before proceeding.
 
 const mongoose = require("mongoose");
 const bcrypt   = require("bcryptjs");
@@ -19,6 +25,11 @@ const userSchema = new mongoose.Schema(
       type: String, enum: ["user", "admin"], default: "user",
     },
     isActive: { type: Boolean, default: true },
+
+    // v2.3.0 — email verification
+    isEmailVerified:  { type: Boolean, default: false },
+    emailVerifiedAt:  { type: Date,    default: null  },
+
     themePreference: { type: String, enum: ["dark", "light"], default: "dark" },
     lastLoginAt: { type: Date },
 
@@ -28,8 +39,29 @@ const userSchema = new mongoose.Schema(
       enum:    ["deep_focus", "memory", "calm", "deep_relaxation", "sleep", null],
       default: null,
     },
-    cognitiveQuizAnswers: { type: mongoose.Schema.Types.Mixed, default: null },
-    cognitiveQuizTakenAt: { type: Date, default: null },
+    cognitiveQuizAnswers:  { type: mongoose.Schema.Types.Mixed, default: null },
+    cognitiveQuizTakenAt:  { type: Date, default: null },
+
+    onboardingCompleted:   { type: Boolean, default: false },
+    onboardingCompletedAt: { type: Date,    default: null  },
+
+    academicProfile: {
+      background: {
+        type: String,
+        enum: ["engineering", "commerce", "medical", "law", "other", null],
+        default: null,
+      },
+      backgroundOther: { type: String, trim: true, default: "" },
+      specialization:  { type: String, trim: true, default: "" },
+      focusAreas: [{ type: String, trim: true }],
+      answers: { type: mongoose.Schema.Types.Mixed, default: null },
+      dashboardConfig: {
+        track:         { type: String,  trim: true, default: "" },
+        practiceMode:  { type: String,  trim: true, default: "" },
+        primaryWidget: { type: String,  trim: true, default: "" },
+        enableMiniIde: { type: Boolean, default: false },
+      },
+    },
   },
   { timestamps: true }
 );

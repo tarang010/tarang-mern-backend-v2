@@ -1,17 +1,20 @@
-// Tarang 2.2.0 — config/bridge.js
+// Tarang 2.2.1 — config/bridge.js
 //
-// v2.2.0 changes:
-//   - bridgePost() helper: auto-retries on 502/503/ECONNREFUSED/timeout
-//     with exponential backoff (1s → 2s → 4s, max 3 attempts)
-//   - wakeBridge(): increased max wait from 90s to 120s, pings every 4s
-//     instead of every 3s (reduces log spam on slow cold starts)
-//   - Axios instance: added explicit timeout on the instance level as well
-//     as per-call (belt-and-suspenders for Render)
+// v2.2.1 fix:
+//   bridgePost() delay comment corrected: cap is 8s (Math.min(..., 8000)),
+//   so the backoff sequence is 1s → 2s → 4s (→ 8s for attempt 4+, if
+//   maxAttempts is ever raised). Previous comment said "1s, 2s, 4s" which
+//   implied a hard cap at 4s, misleading anyone raising maxAttempts.
+//
+// v2.2.0 (retained):
+//   - bridgePost(): auto-retries on 502/503/504/ECONNREFUSED/timeout
+//   - wakeBridge(): max wait 120s, ping every 4s
+//   - Axios instance: explicit timeout at instance level
 
 require("dotenv").config();
 const axios = require("axios");
 
-const BRIDGE_URL       = process.env.PYTHON_BRIDGE_URL || "http://localhost:5010";
+const BRIDGE_URL       = process.env.PYTHON_BRIDGE_URL || "http://localhost:9801";
 const BRIDGE_TIMEOUT   = parseInt(process.env.BRIDGE_TIMEOUT_MS || String(20 * 60 * 1000), 10);
 const WAKE_MAX_WAIT_MS = 120_000;  // 2 min max to wait for cold start
 const WAKE_PING_MS     = 4_000;   // ping every 4s while waking
@@ -28,14 +31,16 @@ const bridge = axios.create({
 // Wraps any bridge call with exponential backoff retry on transient errors.
 // Retryable: 502, 503, 504, ECONNREFUSED, ECONNRESET, ETIMEDOUT, ECONNABORTED
 //
-// Usage — replace:
-//   await bridge.post("/mcq/status", body)
-// With:
-//   await bridgePost("/mcq/status", body)
+// Backoff sequence (exponential, capped at 8s):
+//   attempt 1 fails → wait 1s   (2^0 * 1000)
+//   attempt 2 fails → wait 2s   (2^1 * 1000)
+//   attempt 3 fails → wait 4s   (2^2 * 1000)
+//   attempt 4 fails → wait 8s   (2^3 * 1000, capped at 8000)
+//   (default maxAttempts = 3, so only attempts 1 and 2 produce a retry)
 //
-// For multipart FormData (file upload) use bridge.post() directly with its
-// own PIPELINE_TIMEOUT_MS — FormData streams can't be retried safely.
-const RETRYABLE_CODES   = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ECONNABORTED"]);
+// For multipart FormData (file uploads) use bridge.post() directly —
+// FormData streams cannot be replayed on retry.
+const RETRYABLE_CODES    = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ECONNABORTED"]);
 const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 
 const bridgePost = async (path, body, config = {}, maxAttempts = 3) => {
@@ -49,7 +54,7 @@ const bridgePost = async (path, body, config = {}, maxAttempts = 3) => {
 
       if (!isRetry || attempt === maxAttempts) throw err;
 
-      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000); // 1s, 2s, 4s
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
       console.warn(
         `⚠  Bridge ${path} failed (attempt ${attempt}/${maxAttempts}) | ` +
         `status=${status || err.code} | retrying in ${delay}ms`
@@ -64,7 +69,9 @@ const bridgePost = async (path, body, config = {}, maxAttempts = 3) => {
 
 // ── Wake bridge ───────────────────────────────────────────────────────────────
 // Polls /health until the Python pod responds or WAKE_MAX_WAIT_MS elapses.
-// Called before Phase 1 pipeline to absorb Render cold-start latency.
+// Returns true if bridge is alive, false if timeout exceeded.
+// CALLERS MUST CHECK the return value — a false return means the bridge
+// never woke up and processing should be aborted.
 const wakeBridge = async () => {
   const start = Date.now();
   let attempt = 0;

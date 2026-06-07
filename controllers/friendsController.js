@@ -1,15 +1,18 @@
-// Tarang 1.0.0.1 — controllers/friendsController.js
-// FIX: leaderboard avgScoreRanking now skips analytics docs where averageScorePct
-//      is 0 or null (written during incomplete sessions), preventing users from
-//      appearing as 0% on the leaderboard before they finish all 3 sessions.
+// Tarang 1.1.0 - controllers/friendsController.js
+// Leaderboard now uses completed Session data as the primary source so users
+// appear as soon as they have real completed scores, even before a full
+// 3-session analytics summary exists.
 
-const mongoose  = require("mongoose");
-const User       = require("../models/User");
+const User = require("../models/User");
 const Friendship = require("../models/Friendship");
-const Analytics  = require("../models/Analytics");
-const Session    = require("../models/Session");
+const Analytics = require("../models/Analytics");
+const Session = require("../models/Session");
+const Document = require("../models/Document");
 
-// ── GET /api/friends/search?q=... ─────────────────────────────────────────────
+const normalizePct = (value) => (
+  typeof value === "number" && Number.isFinite(value) ? value : null
+);
+
 // Search users by name or email to add as friend
 const searchUsers = async (req, res) => {
   const { q } = req.query;
@@ -19,14 +22,13 @@ const searchUsers = async (req, res) => {
 
   const regex = new RegExp(q.trim(), "i");
   const users = await User.find({
-    _id:      { $ne: req.user._id },
+    _id: { $ne: req.user._id },
     isActive: true,
     $or: [{ name: regex }, { email: regex }],
   })
     .select("name email createdAt")
     .limit(10);
 
-  // Attach friendship status for each result
   const myId = req.user._id;
   const results = await Promise.all(
     users.map(async (u) => {
@@ -37,12 +39,12 @@ const searchUsers = async (req, res) => {
         ],
       });
       return {
-        _id:              u._id,
-        name:             u.name,
-        email:            u.email,
+        _id: u._id,
+        name: u.name,
+        email: u.email,
         friendshipStatus: friendship?.status || null,
-        friendshipId:     friendship?._id    || null,
-        isRequester:      friendship?.requester.toString() === myId.toString(),
+        friendshipId: friendship?._id || null,
+        isRequester: friendship?.requester?.toString() === myId.toString(),
       };
     })
   );
@@ -50,7 +52,6 @@ const searchUsers = async (req, res) => {
   res.json({ status: "success", data: { users: results } });
 };
 
-// ── POST /api/friends/request ─────────────────────────────────────────────────
 const sendRequest = async (req, res) => {
   const { recipientId } = req.body;
 
@@ -63,7 +64,6 @@ const sendRequest = async (req, res) => {
     return res.status(404).json({ status: "error", error: "User not found." });
   }
 
-  // Check if friendship already exists
   const existing = await Friendship.findOne({
     $or: [
       { requester: req.user._id, recipient: recipientId },
@@ -75,8 +75,8 @@ const sendRequest = async (req, res) => {
     const msg = existing.status === "accepted"
       ? "You are already friends."
       : existing.status === "pending"
-      ? "Friend request already sent."
-      : "Cannot send request.";
+        ? "Friend request already sent."
+        : "Cannot send request.";
     return res.status(409).json({ status: "error", error: msg });
   }
 
@@ -88,18 +88,17 @@ const sendRequest = async (req, res) => {
   res.status(201).json({ status: "success", data: { friendship } });
 };
 
-// ── POST /api/friends/respond ─────────────────────────────────────────────────
 const respondToRequest = async (req, res) => {
-  const { friendshipId, action } = req.body; // action: "accept" | "reject"
+  const { friendshipId, action } = req.body;
 
   if (!["accept", "reject"].includes(action)) {
     return res.status(400).json({ status: "error", error: "Action must be 'accept' or 'reject'." });
   }
 
   const friendship = await Friendship.findOne({
-    _id:       friendshipId,
+    _id: friendshipId,
     recipient: req.user._id,
-    status:    "pending",
+    status: "pending",
   });
 
   if (!friendship) {
@@ -112,8 +111,6 @@ const respondToRequest = async (req, res) => {
   res.json({ status: "success", data: { friendship } });
 };
 
-// ── GET /api/friends ──────────────────────────────────────────────────────────
-// Get all accepted friends + pending requests
 const getFriends = async (req, res) => {
   const myId = req.user._id;
 
@@ -125,13 +122,14 @@ const getFriends = async (req, res) => {
     .populate("recipient", "name email")
     .sort({ updatedAt: -1 });
 
-  const friends  = [];
-  const requests = []; // incoming pending requests
+  const friends = [];
+  const requests = [];
 
   for (const f of friendships) {
     if (f.status === "accepted") {
       const other = f.requester._id.toString() === myId.toString()
-        ? f.recipient : f.requester;
+        ? f.recipient
+        : f.requester;
       friends.push({ friendshipId: f._id, user: other, since: f.updatedAt });
     } else if (f.status === "pending" && f.recipient._id.toString() === myId.toString()) {
       requests.push({ friendshipId: f._id, from: f.requester, sentAt: f.createdAt });
@@ -141,7 +139,6 @@ const getFriends = async (req, res) => {
   res.json({ status: "success", data: { friends, requests } });
 };
 
-// ── DELETE /api/friends/:friendshipId ─────────────────────────────────────────
 const removeFriend = async (req, res) => {
   const { friendshipId } = req.params;
   const myId = req.user._id;
@@ -159,125 +156,228 @@ const removeFriend = async (req, res) => {
   res.json({ status: "success", data: { message: "Friend removed." } });
 };
 
-// ── GET /api/friends/leaderboard ──────────────────────────────────────────────
-// Returns friends-only leaderboard with 3 ranking modes
 const getLeaderboard = async (req, res) => {
   const myId = req.user._id;
 
-  // Get all accepted friends
   const friendships = await Friendship.find({
     $or: [{ requester: myId }, { recipient: myId }],
     status: "accepted",
   });
 
-  // Build list of friend IDs + include self
-  const friendIds = friendships.map((f) =>
+  const friendIds = friendships.map((f) => (
     f.requester.toString() === myId.toString() ? f.recipient : f.requester
-  );
+  ));
   const allIds = [myId, ...friendIds];
 
-  // Fetch analytics for all users in the group
+  const users = await User.find({ _id: { $in: allIds }, isActive: true })
+    .select("name email");
+  const userMap = new Map(users.map((user) => [user._id.toString(), user]));
+
+  const sessions = await Session.find({
+    userId: { $in: allIds },
+    status: "completed",
+    scorePct: { $ne: null },
+  }).select("userId docId sessionNumber scorePct submittedAt");
+
   const analyticsData = await Analytics.find({
     userId: { $in: allIds },
-  }).populate("userId", "name email");
+  }).select("userId docId scoreProgression")
+    .populate("userId", "name email");
 
-  // ── Ranking 1: Overall average score ──────────────────────────────────────
   const avgScoreMap = {};
-  for (const a of analyticsData) {
-    const uid = a.userId._id.toString();
+  const perDocMap = {};
+  const progressMap = {};
+
+  for (const session of sessions) {
+    const uid = session.userId.toString();
+    const user = userMap.get(uid);
+    const scorePct = normalizePct(session.scorePct);
+    if (!user || scorePct == null) continue;
+
     if (!avgScoreMap[uid]) {
       avgScoreMap[uid] = {
-        user:      a.userId,
-        scores:    [],
-        totalDocs: 0,
+        user,
+        scores: [],
+        docIds: new Set(),
+        sessionsCompleted: 0,
       };
     }
-    // FIX: skip analytics docs where averageScorePct is 0 or null — these are
-    //      intermediate records written after session 1 or 2 before the bridge
-    //      has computed a real final score. Including them showed everyone as 0%.
-    if (a.averageScorePct != null && a.averageScorePct > 0) {
-      avgScoreMap[uid].scores.push(a.averageScorePct);
-      avgScoreMap[uid].totalDocs++;
-    }
-  }
 
-  const avgScoreRanking = Object.values(avgScoreMap)
-    .filter((entry) => entry.scores.length > 0) // only show users with real scores
-    .map((entry) => ({
-      user:      entry.user,
-      avgScore:  parseFloat((entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length * 100).toFixed(1)),
-      totalDocs: entry.totalDocs,
-      isMe:      entry.user._id.toString() === myId.toString(),
-    }))
-    .sort((a, b) => b.avgScore - a.avgScore)
-    .map((e, i) => ({ ...e, rank: i + 1 }));
+    avgScoreMap[uid].scores.push(scorePct);
+    avgScoreMap[uid].docIds.add(session.docId);
+    avgScoreMap[uid].sessionsCompleted += 1;
 
-  // ── Ranking 2: Most improved (best S1→S3 jump) ────────────────────────────
-  const improvedMap = {};
-  for (const a of analyticsData) {
-    const uid = a.userId._id.toString();
-    const prog = a.scoreProgression || [];
-    if (prog.length < 3) continue;
-    const s1 = prog.find((p) => p.session === 1)?.score || 0;
-    const s3 = prog.find((p) => p.session === 3)?.score || 0;
-    const improvement = s3 - s1;
-    if (!improvedMap[uid] || improvement > improvedMap[uid].improvement) {
-      improvedMap[uid] = {
-        user:        a.userId,
-        improvement: parseFloat(improvement.toFixed(1)),
-        s1Score:     parseFloat(s1.toFixed(1)),
-        s3Score:     parseFloat(s3.toFixed(1)),
-        isMe:        a.userId._id.toString() === myId.toString(),
+    if (!perDocMap[session.docId]) perDocMap[session.docId] = [];
+    perDocMap[session.docId].push({
+      user,
+      scorePct,
+      isMe: uid === myId.toString(),
+    });
+
+    const progressKey = `${uid}:${session.docId}`;
+    if (!progressMap[progressKey]) {
+      progressMap[progressKey] = {
+        user,
+        points: [],
       };
     }
-  }
-
-  const mostImproved = Object.values(improvedMap)
-    .sort((a, b) => b.improvement - a.improvement)
-    .map((e, i) => ({ ...e, rank: i + 1 }));
-
-  // ── Ranking 3: Per-document (friends who studied same docs) ───────────────
-  const docMap = {}; // docId → [{ user, avgScore }]
-  for (const a of analyticsData) {
-    // FIX: also skip zero scores here for per-doc ranking
-    if (a.averageScorePct == null || a.averageScorePct <= 0) continue;
-    if (!docMap[a.docId]) docMap[a.docId] = { title: null, entries: [] };
-    docMap[a.docId].entries.push({
-      user:  a.userId,
-      score: parseFloat((a.averageScorePct * 100).toFixed(1)),
-      isMe:  a.userId._id.toString() === myId.toString(),
+    progressMap[progressKey].points.push({
+      sessionNumber: session.sessionNumber,
+      scorePct,
     });
   }
 
-  // Only include docs where at least 2 users have data
-  const perDocRanking = Object.entries(docMap)
-    .filter(([, v]) => v.entries.length >= 2)
-    .map(([docId, v]) => ({
-      docId,
-      entries: v.entries
-        .sort((a, b) => b.score - a.score)
-        .map((e, i) => ({ ...e, rank: i + 1 })),
-    }));
+  const avgScoreRanking = Object.values(avgScoreMap)
+    .filter((entry) => entry.scores.length > 0)
+    .map((entry) => ({
+      user: entry.user,
+      avgScore: parseFloat((
+        entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length * 100
+      ).toFixed(1)),
+      totalDocs: entry.docIds.size,
+      sessionsCompleted: entry.sessionsCompleted,
+      isMe: entry.user._id.toString() === myId.toString(),
+    }))
+    .sort((a, b) => b.avgScore - a.avgScore)
+    .map((entry, index) => ({ ...entry, rank: index + 1 }));
 
-  // Populate document titles
-  const Document = require("../models/Document");
-  for (const item of perDocRanking) {
-    const doc = await Document.findOne({ docId: item.docId }).select("title");
-    item.title = doc?.title || item.docId;
+  const improvedMap = {};
+  for (const entry of Object.values(progressMap)) {
+    const ordered = entry.points
+      .slice()
+      .sort((a, b) => a.sessionNumber - b.sessionNumber);
+    if (ordered.length < 2) continue;
+
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    const improvement = (last.scorePct - first.scorePct) * 100;
+    const uid = entry.user._id.toString();
+
+    if (!improvedMap[uid] || improvement > improvedMap[uid].improvement) {
+      improvedMap[uid] = {
+        user: entry.user,
+        improvement: parseFloat(improvement.toFixed(1)),
+        s1Score: parseFloat((first.scorePct * 100).toFixed(1)),
+        s3Score: parseFloat((last.scorePct * 100).toFixed(1)),
+        isMe: uid === myId.toString(),
+      };
+    }
   }
+
+  if (!Object.keys(improvedMap).length) {
+    for (const analytics of analyticsData) {
+      const uid = analytics.userId?._id?.toString?.();
+      const progression = analytics.scoreProgression || [];
+      if (!uid || progression.length < 2 || improvedMap[uid]) continue;
+
+      const ordered = progression
+        .map((point) => ({
+          sessionNumber: point.session,
+          scorePct: (point.score || 0) / 100,
+        }))
+        .sort((a, b) => a.sessionNumber - b.sessionNumber);
+
+      const first = ordered[0];
+      const last = ordered[ordered.length - 1];
+      improvedMap[uid] = {
+        user: analytics.userId,
+        improvement: parseFloat(((last.scorePct - first.scorePct) * 100).toFixed(1)),
+        s1Score: parseFloat((first.scorePct * 100).toFixed(1)),
+        s3Score: parseFloat((last.scorePct * 100).toFixed(1)),
+        isMe: uid === myId.toString(),
+      };
+    }
+  }
+
+  const docIds = Object.keys(perDocMap);
+  const documents = await Document.find({ docId: { $in: docIds } }).select("docId title");
+  const docTitleMap = new Map(documents.map((doc) => [doc.docId, doc.title]));
+
+  const perDocRanking = Object.entries(perDocMap)
+    .map(([docId, entries]) => {
+      const byUser = new Map();
+      for (const entry of entries) {
+        const uid = entry.user._id.toString();
+        if (!byUser.has(uid)) {
+          byUser.set(uid, {
+            user: entry.user,
+            scores: [],
+            isMe: entry.isMe,
+          });
+        }
+        byUser.get(uid).scores.push(entry.scorePct);
+      }
+
+      const rankedEntries = Array.from(byUser.values())
+        .map((entry) => ({
+          user: entry.user,
+          score: parseFloat((
+            entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length * 100
+          ).toFixed(1)),
+          isMe: entry.isMe,
+        }))
+        .sort((a, b) => b.score - a.score)
+        .map((entry, index) => ({ ...entry, rank: index + 1 }));
+
+      return {
+        docId,
+        title: docTitleMap.get(docId) || docId,
+        entries: rankedEntries,
+      };
+    })
+    .filter((doc) => doc.entries.length >= 2);
+
+  const friendSummaries = friendIds
+    .map((friendId) => {
+      const uid = friendId.toString();
+      const user = userMap.get(uid);
+      if (!user) return null;
+
+      const stats = avgScoreMap[uid];
+      return {
+        friendshipUserId: uid,
+        user,
+        avgScore: stats?.scores?.length
+          ? parseFloat((
+              stats.scores.reduce((a, b) => a + b, 0) / stats.scores.length * 100
+            ).toFixed(1))
+          : null,
+        sessionsCompleted: stats?.sessionsCompleted || 0,
+        documentsStudied: stats?.docIds?.size || 0,
+      };
+    })
+    .filter(Boolean);
+
+  const myStats = avgScoreMap[myId.toString()];
 
   res.json({
     status: "success",
     data: {
       avgScoreRanking,
-      mostImproved,
+      mostImproved: Object.values(improvedMap)
+        .sort((a, b) => b.improvement - a.improvement)
+        .map((entry, index) => ({ ...entry, rank: index + 1 })),
       perDocRanking,
       totalFriends: friendIds.length,
+      meSummary: {
+        avgScore: myStats?.scores?.length
+          ? parseFloat((
+              myStats.scores.reduce((a, b) => a + b, 0) / myStats.scores.length * 100
+            ).toFixed(1))
+          : null,
+        sessionsCompleted: myStats?.sessionsCompleted || 0,
+        documentsStudied: myStats?.docIds?.size || 0,
+      },
+      friendSummaries,
     },
   });
 };
 
 module.exports = {
-  searchUsers, sendRequest, respondToRequest,
-  getFriends, removeFriend, getLeaderboard,
+  searchUsers,
+  sendRequest,
+  respondToRequest,
+  getFriends,
+  removeFriend,
+  getLeaderboard,
 };

@@ -1,6 +1,18 @@
 {
   "name": "tarang-backend",
+  "version": "1.0.0",
   "description": "Tarang 1.0.0.1 — Express.js Backend",
+  "homepage": "https://github.com/tarang010/tarang-mern-backend-v2#readme",
+  "bugs": {
+    "url": "https://github.com/tarang010/tarang-mern-backend-v2/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tarang010/tarang-mern-backend-v2.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "nodemon server.js",
@@ -19,15 +31,12 @@
     "form-data": "^4.0.5",
     "helmet": "^7.2.0",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^8.23.0",
+    "mongoose": "^8.24.0",
     "morgan": "^1.10.1",
     "multer": "^2.1.1",
     "nodemailer": "^8.0.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
-  },
-  "version": "1.0.0",
-  "author": "",
-  "license": "ISC"
+  }
 }

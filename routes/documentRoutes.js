@@ -1,17 +1,26 @@
-// Tarang 2.2.0 — routes/documentRoutes.js
+// Tarang 2.5.0 — routes/documentRoutes.js
 //
-// v2.2.0 change:
-//   Added GET /by-doc-id/:docId/stream — SSE endpoint that replaces the
-//   frontend polling loop. Must be declared BEFORE /by-doc-id/:docId so
-//   Express doesn't treat "stream" as a docId value.
+// v2.5.0 changes:
+//   FIX 3: Added POST /upload/stream — SSE proxy for the Python
+//   /pipeline/audio/stream endpoint. Must be declared BEFORE /upload
+//   so Express doesn't try to match "stream" as a sub-path of the
+//   generic upload handler.
 //
-// IMPORTANT: Specific routes MUST come before generic /:id routes in Express.
+//   Route order (Express matches top to bottom):
+//     POST /upload/stream   ← FIX 3: new SSE pipeline proxy
+//     POST /upload          ← existing multipart upload
+//     GET  /by-doc-id/:docId/stream  ← document status SSE
+//     GET  /by-doc-id/:docId         ← one-shot status poll
+//     ...
+//
+// IMPORTANT: Specific/static routes MUST come before generic /:id routes.
 
 const express     = require("express");
 const multer      = require("multer");
 const { protect } = require("../middleware/auth");
 const {
   uploadDocument,
+  streamAudioPipeline,
   triggerMCQ,
   getDocuments,
   getDocumentByDocId,
@@ -33,13 +42,18 @@ const upload  = multer({
 // ── Static / specific routes FIRST ───────────────────────────────────────────
 
 router.get("/",        protect, getDocuments);
-router.post("/upload", protect, upload.single("file"), uploadDocument);
 
-// SSE stream — must come BEFORE /by-doc-id/:docId so Express doesn't
-// match "stream" as the docId parameter on the one-shot route below.
+// FIX 3: SSE audio pipeline proxy — MUST be before POST /upload so Express
+// doesn't strip "stream" as an ambiguous sub-path.
+router.post("/upload/stream", protect, upload.single("file"), streamAudioPipeline);
+
+// Standard upload
+router.post("/upload",        protect, upload.single("file"), uploadDocument);
+
+// SSE document status — MUST be before /by-doc-id/:docId
 router.get("/by-doc-id/:docId/stream", protect, streamDocumentStatus);
 
-// One-shot poll — kept for backward compat, Postman, mobile
+// One-shot poll — kept for backward compat + Postman
 router.get("/by-doc-id/:docId",        protect, getDocumentByDocId);
 
 // ── /:docId sub-routes ────────────────────────────────────────────────────────
