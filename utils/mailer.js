@@ -13,9 +13,24 @@ const nodemailer = require("nodemailer");
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: process.env.MAIL_USER, // your Gmail address
-    pass: process.env.MAIL_PASS, // your Gmail App Password (16 chars, not your login password)
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASS,
   },
+
+  // Prevent hanging forever
+  connectionTimeout: 15000,
+  greetingTimeout: 15000,
+  socketTimeout: 20000,
+});
+
+// Verify SMTP on startup
+transporter.verify((error, success) => {
+  if (error) {
+    console.error("❌ SMTP VERIFY FAILED");
+    console.error(error);
+  } else {
+    console.log("✅ SMTP READY");
+  }
 });
 
 // ── Shared HTML shell ─────────────────────────────────────────────────────────
