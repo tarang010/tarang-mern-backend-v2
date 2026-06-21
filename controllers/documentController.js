@@ -1,4 +1,4 @@
-// Tarang 3.0.0 — controllers/documentController.js
+// Tarang 3.0.1 — controllers/documentController.js
 //
 // ══════════════════════════════════════════════════════════════════════════════
 // ARCHITECTURE CHANGE vs 2.5.1
@@ -35,6 +35,12 @@
 // fixStaleSessions.js:
 //   Still needed — run manually after any crash/redeploy to repair
 //   sessions stuck in "in_progress".
+//
+// ── v3.0.1 changes ────────────────────────────────────────────────────────────
+//   - Added downloadAudio: proxies the Cloudinary audio file through our
+//     server with a Content-Disposition header carrying the real document
+//     title, so users get a properly-named .mp3 instead of the Cloudinary
+//     public_id filename. No DB schema changes.
 // ══════════════════════════════════════════════════════════════════════════════
 
 const Document = require("../models/Document");
@@ -60,6 +66,9 @@ const PART_WORD_MARGIN = parseInt(process.env.TARANG_PART_WORD_MARGIN || "100", 
 
 // Keep-alive interval — 45s (well inside Render's 15-min spin-down)
 const KEEPALIVE_INTERVAL_MS = parseInt(process.env.BRIDGE_KEEPALIVE_MS || "45000", 10);
+
+// Download proxy timeout
+const DOWNLOAD_TIMEOUT_MS = parseInt(process.env.DOWNLOAD_TIMEOUT_MS || "30000", 10);
 
 
 // ── Keep-alive ────────────────────────────────────────────────────────────────
@@ -828,6 +837,62 @@ const getVisualization = async (req, res) => {
 };
 
 
+// ── GET /api/documents/:docId/download ────────────────────────────────────────
+// Streams the audio file through our server (instead of linking directly to
+// Cloudinary) so the browser saves it with the real document title, e.g.
+// "Thermodynamics Chapter 3.mp3", rather than the Cloudinary public_id
+// filename like "a1b2c3d4e5f6_modulated.mp3". Cross-origin <a download>
+// attributes are unreliable across browsers, so this proxy guarantees the
+// Content-Disposition header is honoured everywhere.
+const downloadAudio = async (req, res) => {
+  const { docId } = req.params;
+
+  const doc = await Document.findOne({ docId, userId: req.user._id });
+  if (!doc) {
+    return res.status(404).json({ status: "error", error: "Document not found." });
+  }
+  if (!doc.audioCloudUrl) {
+    return res.status(404).json({ status: "error", error: "Audio not available for this document yet." });
+  }
+
+  // Sanitize title into a filesystem-safe filename
+  const safeName = (doc.title || "tarang_audio")
+    .replace(/[\/\\?%*:|"<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 150) || "tarang_audio";
+
+  try {
+    const axios = require("axios");
+    const upstream = await axios.get(doc.audioCloudUrl, {
+      responseType: "stream",
+      timeout: DOWNLOAD_TIMEOUT_MS,
+    });
+
+    res.setHeader("Content-Type", upstream.headers["content-type"] || "audio/mpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}.mp3"`);
+    if (upstream.headers["content-length"]) {
+      res.setHeader("Content-Length", upstream.headers["content-length"]);
+    }
+
+    upstream.data.pipe(res);
+
+    upstream.data.on("error", (err) => {
+      console.error(`✗ downloadAudio stream error | docId=${docId} | ${err.message}`);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+  } catch (err) {
+    console.error(`✗ downloadAudio FAILED | docId=${docId} | ${err.message}`);
+    if (!res.headersSent) {
+      res.status(502).json({ status: "error", error: "Failed to fetch audio file." });
+    } else {
+      res.end();
+    }
+  }
+};
+
+
 module.exports = {
   uploadDocument,
   streamAudioPipeline,
@@ -839,6 +904,7 @@ module.exports = {
   deleteDocument,
   getCaptions,
   getVisualization,
+  downloadAudio,
   recoverStuckDocuments,
   startBridgeKeepAlive,
 };
