@@ -29,6 +29,7 @@ const {
   deleteDocument,
   getCaptions,
   getVisualization,
+  downloadAudio,
 } = require("../controllers/documentController");
 
 const router  = express.Router();
@@ -55,6 +56,9 @@ router.get("/by-doc-id/:docId/stream", protect, streamDocumentStatus);
 
 // One-shot poll — kept for backward compat + Postman
 router.get("/by-doc-id/:docId",        protect, getDocumentByDocId);
+
+// Download Audio
+router.get("/:docId/download", protect, downloadAudio)
 
 // ── /:docId sub-routes ────────────────────────────────────────────────────────
 router.post("/:docId/trigger-mcq",   protect, triggerMCQ);
