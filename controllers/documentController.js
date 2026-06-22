@@ -1,4 +1,4 @@
-// Tarang 3.0.1 — controllers/documentController.js
+// Tarang 3.0.2 — controllers/documentController.js
 //
 // ══════════════════════════════════════════════════════════════════════════════
 // ARCHITECTURE CHANGE vs 2.5.1
@@ -41,6 +41,29 @@
 //     server with a Content-Disposition header carrying the real document
 //     title, so users get a properly-named .mp3 instead of the Cloudinary
 //     public_id filename. No DB schema changes.
+//
+// ── v3.0.2 changes ────────────────────────────────────────────────────────────
+//   - FIX: downloadAudio was failing for multi-part documents whose titles
+//     contain the em dash character "—" (U+2014, e.g. "Doc Title — Part 1").
+//     The em dash is non-ASCII and is not stripped by the previous safeName
+//     regex, so it ended up raw in the Content-Disposition filename= parameter,
+//     violating RFC 7230. Some HTTP clients / Render's proxy rejected the
+//     malformed header, causing the frontend blob fetch to throw and the user
+//     to see "Download failed."
+//
+//     Single-document titles (pure ASCII) were unaffected, which is why only
+//     multi-part downloads were broken.
+//
+//     Fix: use RFC 5987 filename* encoding (UTF-8 percent-encoding) for the
+//     Content-Disposition header so any Unicode character in the title is
+//     transmitted safely. A plain ASCII filename= fallback is included for
+//     older HTTP/1.0 clients that don't understand filename*.
+//
+//     The ASCII fallback is produced by replacing every non-ASCII character
+//     with an underscore after the existing sanitisation pass, so filenames
+//     like "Python for Data Analysis — Part 1.mp3" become
+//     "Python for Data Analysis _ Part 1.mp3" in the fallback and the full
+//     Unicode title in the filename* slot.
 // ══════════════════════════════════════════════════════════════════════════════
 
 const Document = require("../models/Document");
@@ -838,12 +861,26 @@ const getVisualization = async (req, res) => {
 
 
 // ── GET /api/documents/:docId/download ────────────────────────────────────────
-// Streams the audio file through our server (instead of linking directly to
-// Cloudinary) so the browser saves it with the real document title, e.g.
-// "Thermodynamics Chapter 3.mp3", rather than the Cloudinary public_id
-// filename like "a1b2c3d4e5f6_modulated.mp3". Cross-origin <a download>
-// attributes are unreliable across browsers, so this proxy guarantees the
-// Content-Disposition header is honoured everywhere.
+// Streams the Cloudinary audio file through our server so browsers save it
+// with the real document title (e.g. "Thermodynamics Chapter 3.mp3") rather
+// than the Cloudinary public_id filename.
+//
+// v3.0.1 used a bare  filename="<title>.mp3"  header.  That works fine for
+// pure-ASCII titles, but multi-part documents have titles like
+// "Python for Data Analysis — Part 1" which contain the em dash U+2014.
+// Non-ASCII bytes in a bare filename= parameter violate RFC 7230 and are
+// rejected by some HTTP clients / Render's edge proxy, causing the frontend
+// blob-fetch to throw and the user to see "Download failed."
+//
+// v3.0.2 fix: build the Content-Disposition header with BOTH:
+//   filename="<ascii-safe fallback>.mp3"         ← for HTTP/1.0 clients
+//   filename*=UTF-8''<percent-encoded title>.mp3  ← RFC 5987, takes precedence
+//
+// The ASCII fallback is produced by replacing every non-ASCII codepoint with
+// an underscore after the existing sanitisation pass, so the em dash in
+// "Doc — Part 1" becomes "Doc _ Part 1" in the fallback slot while the full
+// Unicode title is preserved in the filename* slot.
+// ─────────────────────────────────────────────────────────────────────────────
 const downloadAudio = async (req, res) => {
   const { docId } = req.params;
 
@@ -855,12 +892,34 @@ const downloadAudio = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Audio not available for this document yet." });
   }
 
-  // Sanitize title into a filesystem-safe filename
-  const safeName = (doc.title || "tarang_audio")
-    .replace(/[\/\\?%*:|"<>]/g, "")
-    .replace(/\s+/g, " ")
+  // ── Build a sanitised title safe for both filename slots ──────────────────
+  //
+  // Step 1 — strip characters that are always illegal in filenames on any OS
+  //   (forward/back slash, question mark, percent, asterisk, colon, pipe,
+  //    double-quote, angle brackets).
+  // Step 2 — collapse runs of whitespace and trim, limit to 150 chars.
+  // Step 3 — produce the Unicode title (used in filename*).
+  // Step 4 — produce the ASCII fallback (used in filename=) by replacing
+  //   every codepoint above U+007E with an underscore.
+  //
+  const sanitised = (doc.title || "tarang_audio")
+    .replace(/[\/\\?%*:|"<>]/g, "")   // strip filesystem-illegal chars
+    .replace(/\s+/g, " ")              // normalise whitespace
     .trim()
     .slice(0, 150) || "tarang_audio";
+
+  // Unicode title for RFC 5987 filename* — percent-encode everything except
+  // the unreserved characters defined in RFC 3986 (A-Z a-z 0-9 - _ . ~ and
+  // a handful of safe extras).  encodeURIComponent covers this correctly.
+  const encodedTitle = encodeURIComponent(sanitised + ".mp3");
+
+  // ASCII-only fallback for legacy filename= — replace non-ASCII with "_"
+  const asciiTitle = sanitised.replace(/[^\x20-\x7E]/g, "_") + ".mp3";
+
+  // RFC 6266 §4.3 — include both parameters; filename* takes precedence in
+  // any RFC 5987-aware client (all modern browsers and Node fetch).
+  const contentDisposition =
+    `attachment; filename="${asciiTitle}"; filename*=UTF-8''${encodedTitle}`;
 
   try {
     const axios = require("axios");
@@ -870,7 +929,7 @@ const downloadAudio = async (req, res) => {
     });
 
     res.setHeader("Content-Type", upstream.headers["content-type"] || "audio/mpeg");
-    res.setHeader("Content-Disposition", `attachment; filename="${safeName}.mp3"`);
+    res.setHeader("Content-Disposition", contentDisposition);
     if (upstream.headers["content-length"]) {
       res.setHeader("Content-Length", upstream.headers["content-length"]);
     }
